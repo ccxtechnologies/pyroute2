@@ -20,5 +20,3 @@ benchmark.log
 venv
 .venv
 .nox*
-tests/*.db
-tests/*.json

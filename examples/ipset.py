@@ -1,6 +1,5 @@
 import socket
-
-from pyroute2.ipset import IPSet, PortEntry, PortRange
+from pyroute2.ipset import IPSet, PortRange, PortEntry
 
 ipset = IPSet()
 ipset.create("foo", stype="hash:ip")

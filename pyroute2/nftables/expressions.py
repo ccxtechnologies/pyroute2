@@ -2,8 +2,6 @@ import socket
 import struct
 from collections import OrderedDict
 
-from pyroute2.netlink.nfnetlink.nftsocket import Cmp, Regs
-
 
 ##
 # Utility functions
@@ -33,13 +31,9 @@ def genex(name, kwarg):
     }
 
 
-def masq():
-    return [genex('masq', {})]
-
-
 def verdict(code):
     kwarg = OrderedDict()
-    kwarg['dreg'] = Regs.NFT_REG_VERDICT
+    kwarg['dreg'] = 0  # NFT_REG_VERDICT
     kwarg['data'] = {
         'attrs': [
             ('NFTA_DATA_VERDICT', {'attrs': [('NFTA_VERDICT_CODE', code)]})
@@ -48,7 +42,7 @@ def verdict(code):
     return [genex('immediate', kwarg)]
 
 
-def ipv4addr(src=None, dst=None, op=Cmp.NFT_CMP_EQ):
+def ipv4addr(src=None, dst=None):
     if not src and not dst:
         raise ValueError('must be at least one of src, dst')
 
@@ -94,10 +88,8 @@ def ipv4addr(src=None, dst=None, op=Cmp.NFT_CMP_EQ):
     if dst:
         packed += socket.inet_aton(dst)
     kwarg = OrderedDict()
-    kwarg['sreg'] = Regs.NFT_REG_1  # read from NFT_REG_1
-    # NFT_CMP_EQ = 0
-    # NFT_CMP_NEQ = 1
-    kwarg['op'] = op  # nftsocket.nft_contains_expr.nft_expr.nft_cmp.ops
+    kwarg['sreg'] = 1  # read from NFT_REG_1
+    kwarg['op'] = 0  # NFT_CMP_EQ
     kwarg['data'] = {'attrs': [('NFTA_DATA_VALUE', packed)]}
     ret.append(genex('cmp', kwarg))
     return ret

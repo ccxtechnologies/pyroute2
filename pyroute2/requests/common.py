@@ -4,7 +4,6 @@ from collections import OrderedDict
 from socket import AF_INET, AF_INET6
 
 from pyroute2.common import AF_MPLS, dqn2int, get_address_family
-from pyroute2.netlink.rtnl.ifinfmsg import ifinfmsg
 
 
 class MPLSTarget(OrderedDict):
@@ -108,11 +107,11 @@ class IPTargets:
 
     def set_dst(self, context, value):
         if value in ('', 'default'):
-            return {}
-        elif value in ('0', '0.0.0.0', '0.0.0.0/0'):
-            return {'family': AF_INET}
+            return {'dst': ''}
+        elif value in ('0', '0.0.0.0'):
+            return {'dst': '', 'family': AF_INET}
         elif value in ('::', '::/0'):
-            return {'family': AF_INET6}
+            return {'dst': '', 'family': AF_INET6}
         return self.parse_target('dst', context, value)
 
     def set_src(self, context, value):
@@ -132,8 +131,6 @@ class Index:
     def set_index(self, context, value):
         if isinstance(value, (list, tuple)):
             value = value[0]
-        if isinstance(value, ifinfmsg):
-            value = value['index']
         return {'index': value}
 
 
@@ -150,7 +147,7 @@ class IPRouteFilter:
 class NLAKeyTransform:
     _nla_prefix = ''
 
-    def key_transform(self, key):
+    def _key_transform(self, key):
         if isinstance(key, str) and key.startswith(self._nla_prefix):
             key = key[len(self._nla_prefix) :].lower()
         return key

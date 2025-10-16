@@ -4,14 +4,14 @@
 
     from pyroute2 import NDB
     from pyroute2 import config
-    config.mock_netlink = True
+    config.mock_iproute = True
     ndb = NDB()
 
 .. testsetup:: tables
 
     from pyroute2 import NDB
     from pyroute2 import config
-    config.mock_netlink = True
+    config.mock_iproute = True
     ndb = NDB()
     ndb.routes.create(
         dst='1.1.1.1/32', gateway='127.0.0.10', oif=1, table=101
@@ -27,7 +27,7 @@
 
     from pyroute2 import NDB
     from pyroute2 import config
-    config.mock_netlink = True
+    config.mock_iproute = True
     ndb = NDB()
     ndb.routes.create(
         dst='10.0.0.0/24', gateway='127.0.0.10'
@@ -121,9 +121,9 @@ from pyroute2.netlink.rtnl.rtmsg import LWTUNNEL_ENCAP_MPLS, nh, rtmsg
 from pyroute2.requests.common import MPLSTarget
 from pyroute2.requests.route import RouteFieldFilter
 
-from ..objects import AsyncObject, RTNL_Object
+from ..auth_manager import check_auth
+from ..objects import RTNL_Object
 from ..report import Record
-from ..sync_api import Flags, SyncBase
 
 _dump_rt = ['main.f_%s' % x[0] for x in rtmsg.sql_schema()][:-2]
 _dump_nh = ['nh.f_%s' % x[0] for x in nh.sql_schema()][:-2]
@@ -134,10 +134,10 @@ F_RTA_METRICS = 4
 
 
 def get_route_id(schema, target, event):
-    keys = ['f_target = ?']
+    keys = ['f_target = %s' % schema.plch]
     values = [target]
     for key in schema.indices['routes']:
-        keys.append(f'f_{key} = ?')
+        keys.append('f_%s = %s' % (key, schema.plch))
         values.append(event.get(key) or event.get_attr(key))
     #
     spec = 'WHERE %s' % ' AND '.join(keys)
@@ -153,7 +153,7 @@ def get_route_id(schema, target, event):
     return str(uuid.uuid4())
 
 
-async def load_rtmsg(schema, sources, target, event):
+def load_rtmsg(schema, target, event):
     route_id = None
     post = []
 
@@ -209,12 +209,7 @@ async def load_rtmsg(schema, sources, target, event):
                 mp[idx]['nh_id'] = idx  # add NH number
                 post.append(
                     partial(
-                        schema.load_netlink,
-                        'nh',
-                        sources,
-                        target,
-                        mp[idx],
-                        'routes',
+                        schema.load_netlink, 'nh', target, mp[idx], 'routes'
                     )
                 )
                 event['deps'] |= F_RTA_MULTIPATH
@@ -230,12 +225,7 @@ async def load_rtmsg(schema, sources, target, event):
             encap['route_id'] = route_id
             post.append(
                 partial(
-                    schema.load_netlink,
-                    'enc_mpls',
-                    sources,
-                    target,
-                    encap,
-                    'routes',
+                    schema.load_netlink, 'enc_mpls', target, encap, 'routes'
                 )
             )
             event['deps'] |= F_RTA_ENCAP
@@ -252,22 +242,17 @@ async def load_rtmsg(schema, sources, target, event):
             metrics['route_id'] = route_id
             post.append(
                 partial(
-                    schema.load_netlink,
-                    'metrics',
-                    sources,
-                    target,
-                    metrics,
-                    'routes',
+                    schema.load_netlink, 'metrics', target, metrics, 'routes'
                 )
             )
             event['deps'] |= F_RTA_METRICS
     #
     if route_id is not None:
         event['route_id'] = route_id
-    await schema.load_netlink('routes', sources, target, event)
+    schema.load_netlink('routes', target, event)
     #
     for procedure in post:
-        await procedure()
+        procedure()
 
 
 def rtmsg_gc_mark(schema, target, event, gc_mark=None):
@@ -280,14 +265,17 @@ def rtmsg_gc_mark(schema, target, event, gc_mark=None):
     # select all routes for that OIF where f_gc_mark is not null
     #
     key_fields = ','.join(['f_%s' % x for x in schema.indices['routes']])
-    key_query = ' AND '.join([f'f_{x} = ?' for x in schema.indices['routes']])
+    key_query = ' AND '.join(
+        ['f_%s = %s' % (x, schema.plch) for x in schema.indices['routes']]
+    )
     routes = schema.execute(
-        f'''
-           SELECT {key_fields},f_RTA_GATEWAY FROM routes WHERE
-           f_target = ? AND f_RTA_OIF = ? AND
-           f_RTA_GATEWAY IS NOT NULL {gc_clause} AND
-           f_family = 2
-        ''',
+        '''
+                       SELECT %s,f_RTA_GATEWAY FROM routes WHERE
+                       f_target = %s AND f_RTA_OIF = %s AND
+                       f_RTA_GATEWAY IS NOT NULL %s AND
+                       f_family = 2
+                       '''
+        % (key_fields, schema.plch, schema.plch, gc_clause),
         (target, event.get_attr('RTA_OIF')),
     ).fetchmany()
     #
@@ -309,10 +297,9 @@ def rtmsg_gc_mark(schema, target, event, gc_mark=None):
             if gwnet == net:
                 (
                     schema.execute(
-                        f'''
-                            UPDATE routes SET f_gc_mark = ?
-                            WHERE f_target = ? AND {key_query}
-                        ''',
+                        'UPDATE routes SET f_gc_mark = %s '
+                        'WHERE f_target = %s AND %s'
+                        % (schema.plch, schema.plch, key_query),
                         (gc_mark, target) + route[:-1],
                     )
                 )
@@ -416,7 +403,7 @@ class Via(OrderedDict):
         return repr(dict(self))
 
 
-class Route(AsyncObject):
+class Route(RTNL_Object):
     table = 'routes'
     msg_class = rtmsg
     hidden_fields = ['route_id']
@@ -428,23 +415,28 @@ class Route(AsyncObject):
     @classmethod
     def _count(cls, view):
         if view.chain:
-            return view.ndb.schema.fetchone(
-                f'SELECT count(*) FROM {view.table} WHERE f_RTA_OIF = ?',
+            return view.ndb.task_manager.db_fetchone(
+                'SELECT count(*) FROM %s WHERE f_RTA_OIF = %s'
+                % (view.table, view.ndb.schema.plch),
                 [view.chain['index']],
             )
         else:
-            return view.ndb.schema.fetchone(
-                f'SELECT count(*) FROM {view.table}'
+            return view.ndb.task_manager.db_fetchone(
+                'SELECT count(*) FROM %s' % view.table
             )
 
     @classmethod
     def _dump_where(cls, view):
         if view.chain:
+            plch = view.ndb.schema.plch
             where = '''
                     WHERE
-                        main.f_target = ? AND
-                        main.f_RTA_OIF = ?
-                    '''
+                        main.f_target = %s AND
+                        main.f_RTA_OIF = %s
+                    ''' % (
+                plch,
+                plch,
+            )
             values = [view.chain['target'], view.chain['index']]
         else:
             where = ''
@@ -493,7 +485,7 @@ class Route(AsyncObject):
             'gateway',
         )
         where, values = cls._dump_where(view)
-        for record in view.ndb.schema.fetch(req + where, values):
+        for record in view.ndb.task_manager.db_fetch(req + where, values):
             yield record
 
     @classmethod
@@ -514,16 +506,20 @@ class Route(AsyncObject):
             + ['metrics', 'encap']
         )
         yield header
+        plch = view.ndb.schema.plch
         where, values = cls._dump_where(view)
-        for record in view.ndb.schema.fetch(req + where, values):
+        for record in view.ndb.task_manager.db_fetch(req + where, values):
             route_id = record[-1]
             record = list(record[:-1])
             if route_id is not None:
                 #
                 # fetch metrics
                 metrics = tuple(
-                    view.ndb.schema.fetch(
-                        'SELECT * FROM metrics WHERE f_route_id = ?',
+                    view.ndb.task_manager.db_fetch(
+                        '''
+                    SELECT * FROM metrics WHERE f_route_id = %s
+                '''
+                        % (plch,),
                         (route_id,),
                     )
                 )
@@ -543,8 +539,11 @@ class Route(AsyncObject):
                 #
                 # fetch encap
                 enc_mpls = tuple(
-                    view.ndb.schema.fetch(
-                        'SELECT * FROM enc_mpls WHERE f_route_id = ?',
+                    view.ndb.task_manager.db_fetch(
+                        '''
+                    SELECT * FROM enc_mpls WHERE f_route_id = %s
+                '''
+                        % (plch,),
                         (route_id,),
                     )
                 )
@@ -557,10 +556,10 @@ class Route(AsyncObject):
             yield record
 
     @classmethod
-    def spec_normalize(cls, spec):
+    def spec_normalize(cls, processed, spec):
         if isinstance(spec, basestring):
-            return {'dst': spec}
-        return spec
+            processed['dst'] = spec
+        return processed
 
     @classmethod
     def compare_record(self, left, right):
@@ -586,14 +585,16 @@ class Route(AsyncObject):
     }
 
     def mark_tflags(self, mark):
+        plch = (self.schema.plch,) * 4
         self.schema.execute(
             '''
-               UPDATE interfaces SET
-                   f_tflags = ?
-               WHERE
-                   (f_index = ? OR f_index = ?)
-                   AND f_target = ?
-            ''',
+                            UPDATE interfaces SET
+                                f_tflags = %s
+                            WHERE
+                                (f_index = %s OR f_index = %s)
+                                AND f_target = %s
+                            '''
+            % plch,
             (mark, self['iif'], self['oif'], self['target']),
         )
 
@@ -680,6 +681,7 @@ class Route(AsyncObject):
             req['gateway'] = self['gateway']
         return req
 
+    @check_auth('obj:modify')
     def __setitem__(self, key, value):
         if key == 'route_id':
             raise ValueError('route_id is read only')
@@ -689,7 +691,9 @@ class Route(AsyncObject):
                 mp = dict(mp)
                 if self.state == 'invalid':
                     mp['create'] = True
-                obj = NextHop(self, self.view, mp)
+                obj = NextHop(
+                    self, self.view, mp, auth_managers=self.auth_managers
+                )
                 obj.state.set(self.state.get())
                 self['multipath'].append(obj)
             if key in self.changed:
@@ -698,7 +702,9 @@ class Route(AsyncObject):
             value = dict(value)
             if not isinstance(self['metrics'], Metrics):
                 value['create'] = True
-            obj = Metrics(self, self.view, value)
+            obj = Metrics(
+                self, self.view, value, auth_managers=self.auth_managers
+            )
             obj.state.set(self.state.get())
             super(Route, self).__setitem__('metrics', obj)
             if key in self.changed:
@@ -721,6 +727,7 @@ class Route(AsyncObject):
         else:
             super(Route, self).__setitem__(key, value)
 
+    @check_auth('obj:modify')
     def apply(self, rollback=False, req_filter=None, mode='apply'):
         if (
             (self.get('table') == 255)
@@ -751,8 +758,9 @@ class Route(AsyncObject):
         if self['deps'] & F_RTA_ENCAP:
             for _ in range(5):
                 enc = tuple(
-                    self.schema.fetch(
-                        'SELECT * FROM enc_mpls WHERE f_route_id = ?',
+                    self.task_manager.db_fetch(
+                        'SELECT * FROM enc_mpls WHERE f_route_id = %s'
+                        % (self.schema.plch,),
                         (self['route_id'],),
                     )
                 )
@@ -772,14 +780,18 @@ class Route(AsyncObject):
         if self['deps'] & F_RTA_METRICS:
             for _ in range(5):
                 metrics = tuple(
-                    self.schema.fetch(
-                        'SELECT * FROM metrics WHERE f_route_id = ?',
+                    self.task_manager.db_fetch(
+                        'SELECT * FROM metrics WHERE f_route_id = %s'
+                        % (self.schema.plch,),
                         (self['route_id'],),
                     )
                 )
                 if metrics:
                     self['metrics'] = Metrics(
-                        self, self.view, {'route_id': self['route_id']}
+                        self,
+                        self.view,
+                        {'route_id': self['route_id']},
+                        auth_managers=self.auth_managers,
                     )
                     break
                 time.sleep(0.1)
@@ -792,13 +804,9 @@ class Route(AsyncObject):
         #
         # FIXME: use self['deps']
         if 'nh_id' not in self and self.get('route_id') is not None:
-            nhs = iter(
-                tuple(
-                    self.schema.fetch(
-                        'SELECT * FROM nh WHERE f_route_id = ?',
-                        (self['route_id'],),
-                    )
-                )
+            nhs = self.task_manager.db_fetch(
+                'SELECT * FROM nh WHERE f_route_id = %s' % (self.schema.plch,),
+                (self['route_id'],),
             )
 
             flush = False
@@ -824,71 +832,19 @@ class Route(AsyncObject):
 
             for nexthop in nhs:
                 key = {'route_id': self['route_id'], 'nh_id': nexthop[-1]}
-                (self['multipath'].append(NextHop(self, self.view, key)))
+                (
+                    self['multipath'].append(
+                        NextHop(
+                            self,
+                            self.view,
+                            key,
+                            auth_managers=self.auth_managers,
+                        )
+                    )
+                )
 
 
-class NextHop(AsyncObject):
-    msg_class = nh
-    table = 'nh'
-    hidden_fields = ('route_id', 'target')
-
-    def mark_tflags(self, mark):
-        self.schema.execute(
-            '''
-               UPDATE interfaces SET
-                   f_tflags = ?
-               WHERE
-                   (f_index = ? OR f_index = ?)
-                   AND f_target = ?
-            ''',
-            (mark, self.route['iif'], self.route['oif'], self.route['target']),
-        )
-
-    def __init__(self, route, *argv, **kwarg):
-        self.route = route
-        kwarg['iclass'] = nh
-        kwarg['check'] = False
-        super(NextHop, self).__init__(*argv, **kwarg)
-
-
-class MetricsStub(dict):
-    def __init__(self, route):
-        self.route = route
-
-    def __setitem__(self, key, value):
-        # This assignment forces the Metrics object to replace
-        # MetricsStub; it is the MetricsStub object end of life
-        self.route['metrics'] = {key: value}
-
-    def __getitem__(self, key):
-        raise KeyError('metrics not initialized for this route')
-
-
-class Metrics(AsyncObject):
-    msg_class = rtmsg.metrics
-    table = 'metrics'
-    hidden_fields = ('route_id', 'target')
-
-    def mark_tflags(self, mark):
-        self.schema.execute(
-            '''
-               UPDATE interfaces SET
-                   f_tflags = ?
-               WHERE
-                   (f_index = ? OR f_index = ?)
-                   AND f_target = ?
-            ''',
-            (mark, self.route['iif'], self.route['oif'], self.route['target']),
-        )
-
-    def __init__(self, route, *argv, **kwarg):
-        self.route = route
-        kwarg['iclass'] = rtmsg.metrics
-        kwarg['check'] = False
-        super(Metrics, self).__init__(*argv, **kwarg)
-
-
-class RouteSub(SyncBase):
+class RouteSub:
     def apply(self, rollback=False, req_filter=None, mode='apply'):
         return self.route.apply(rollback, req_filter, mode)
 
@@ -904,43 +860,67 @@ class RouteSub(SyncBase):
     def __exit__(self, exc_type, exc_value, traceback):
         self.commit()
 
-    def __getitem__(self, key):
-        return self._main_sync_call(self.asyncore.__getitem__, key)
+
+class NextHop(RouteSub, RTNL_Object):
+    msg_class = nh
+    table = 'nh'
+    hidden_fields = ('route_id', 'target')
+
+    def mark_tflags(self, mark):
+        plch = (self.schema.plch,) * 4
+        self.schema.execute(
+            '''
+                            UPDATE interfaces SET
+                                f_tflags = %s
+                            WHERE
+                                (f_index = %s OR f_index = %s)
+                                AND f_target = %s
+                            '''
+            % plch,
+            (mark, self.route['iif'], self.route['oif'], self.route['target']),
+        )
+
+    def __init__(self, route, *argv, **kwarg):
+        self.route = route
+        kwarg['iclass'] = nh
+        kwarg['check'] = False
+        super(NextHop, self).__init__(*argv, **kwarg)
+
+
+class MetricsStub(RouteSub, dict):
+    def __init__(self, route):
+        self.route = route
 
     def __setitem__(self, key, value):
-        return self._main_sync_call(self.asyncore.__setitem__, key, value)
-
-
-class SyncRoute(RTNL_Object):
-
-    def __init__(self, event_loop, asyncore, class_map=None, flags=Flags.RO):
-        super().__init__(event_loop, asyncore, class_map, flags)
-
-    @property
-    def metrics(self):
-        metrics = self._main_sync_call(self.asyncore.__getitem__, 'metrics')
-        ret = RouteSub(self.event_loop, metrics, self.class_map, self.flags)
-        ret.route = self
-        return ret
-
-    @property
-    def multipath(self):
-        mp = self._main_sync_call(self.asyncore.__getitem__, 'multipath')
-        ret = []
-        for nexthop in mp:
-            rs = RouteSub(self.event_loop, nexthop, self.class_map, self.flags)
-            rs.route = self
-            ret.append(rs)
-        return ret
+        # This assignment forces the Metrics object to replace
+        # MetricsStub; it is the MetricsStub object end of life
+        self.route['metrics'] = {key: value}
 
     def __getitem__(self, key):
-        if key == 'metrics':
-            return self.metrics
-        if key == 'multipath':
-            return self.multipath
-        return super().__getitem__(key)
+        raise KeyError('metrics not initialized for this route')
 
-    def get(self, key, *argv):
-        if key in ('metrics', 'multipath'):
-            return self[key]
-        return super().get(key, *argv)
+
+class Metrics(RouteSub, RTNL_Object):
+    msg_class = rtmsg.metrics
+    table = 'metrics'
+    hidden_fields = ('route_id', 'target')
+
+    def mark_tflags(self, mark):
+        plch = (self.schema.plch,) * 4
+        self.schema.execute(
+            '''
+                            UPDATE interfaces SET
+                                f_tflags = %s
+                            WHERE
+                                (f_index = %s OR f_index = %s)
+                                AND f_target = %s
+                            '''
+            % plch,
+            (mark, self.route['iif'], self.route['oif'], self.route['target']),
+        )
+
+    def __init__(self, route, *argv, **kwarg):
+        self.route = route
+        kwarg['iclass'] = rtmsg.metrics
+        kwarg['check'] = False
+        super(Metrics, self).__init__(*argv, **kwarg)

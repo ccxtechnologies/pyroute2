@@ -14,7 +14,7 @@ inheritance_graph_attrs = {'rankdir': 'LR', 'ratio': 'auto'}
 source_suffix = '.rst'
 master_doc = 'index'
 project = u'pyroute2'
-copyright = u'pyroute2 team'
+copyright = u'Peter Saveliev and PyRoute2 team'
 
 release = pyroute2.__version__
 
@@ -42,14 +42,7 @@ man_pages = [
         'pyroute2-dhcp-client',
         'pyroute2-dhcp-client',
         'pyroute2 dhcp client',
-        ['Étienne Noss', 'Peter Saveliev'],
-        1,
-    ),
-    (
-        'dhcp-server-detector',
-        'dhcp-server-detector',
-        'dhcp server detector',
-        ['Étienne Noss'],
+        ['Peter Saveliev'],
         1,
     ),
 ]

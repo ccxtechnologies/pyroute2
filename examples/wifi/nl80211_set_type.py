@@ -1,5 +1,8 @@
-from pyroute2 import IW, IPRoute
+import errno
+from pyroute2 import IW
+from pyroute2 import IPRoute
 from pyroute2.netlink.exceptions import NetlinkError
+from pyroute2.netlink.nl80211 import IFTYPE_NAMES
 
 # interface name to check
 ifname = 'wlx2'

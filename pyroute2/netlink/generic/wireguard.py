@@ -55,12 +55,10 @@ NOTES:
     struct peer_s {
         public_key:            # Base64 public key - required
         remove:                # Boolean - optional
-        update_only:           # Boolean - optional
         preshared_key:         # Base64 preshared key - optional
         endpoint_addr:         # IPv4 or IPv6 endpoint - optional
         endpoint_port :        # endpoint Port - required only if endpoint_addr
         persistent_keepalive:  # time in seconds to send keep alive - optional
-        replace_allowed_ips:   # Boolean - optional
         allowed_ips:           # list of CIDRs allowed - optional
     }
 '''
@@ -73,18 +71,13 @@ from socket import inet_ntoa, inet_aton, inet_pton, AF_INET, AF_INET6
 from struct import pack, unpack
 from time import ctime
 
-from pyroute2.netlink import (
-    NLA_F_NESTED,
-    NLM_F_ACK,
-    NLM_F_DUMP,
-    NLM_F_REQUEST,
-    genlmsg,
-    nla,
-)
-from pyroute2.netlink.generic import (
-    AsyncGenericNetlinkSocket,
-    GenericNetlinkSocket,
-)
+from pr2modules.netlink import genlmsg
+from pr2modules.netlink import nla
+from pr2modules.netlink import NLM_F_ACK
+from pr2modules.netlink import NLM_F_DUMP
+from pr2modules.netlink import NLA_F_NESTED
+from pr2modules.netlink import NLM_F_REQUEST
+from pr2modules.netlink.generic import GenericNetlinkSocket
 
 # Defines from uapi/wireguard.h
 WG_GENL_NAME = "wireguard"
@@ -107,7 +100,7 @@ WGDEVICE_A_FWMARK = 7
 WGDEVICE_A_PEERS = 8
 
 # WireGuard Device flags
-WGDEVICE_F_REPLACE_PEERS = 0x1
+WGDEVICE_F_REPLACE_PEERS = 1
 
 # WireGuard Allowed IP attributes
 WGALLOWEDIP_A_UNSPEC = 0
@@ -116,9 +109,9 @@ WGALLOWEDIP_A_IPADDR = 2
 WGALLOWEDIP_A_CIDR_MASK = 3
 
 # WireGuard Peer flags
-WGPEER_F_REMOVE_ME = 0x1
-WGPEER_F_REPLACE_ALLOWEDIPS = 0x2
-WGPEER_F_UPDATE_ONLY = 0x4
+WGPEER_F_REMOVE_ME = 0
+WGPEER_F_REPLACE_ALLOWEDIPS = 1
+WGPEER_F_UPDATE_ONLY = 2
 
 # Specific defines
 WG_MAX_PEERS = 1000
@@ -238,15 +231,12 @@ class wgmsg(genlmsg):
             nla.encode(self)
 
 
-class AsyncWireGuard(AsyncGenericNetlinkSocket):
+class WireGuard(GenericNetlinkSocket):
+    def __init__(self, *args, **kwargs):
+        GenericNetlinkSocket.__init__(self, *args, **kwargs)
+        self.bind(WG_GENL_NAME, wgmsg)
 
-    async def setup_endpoint(self):
-        if getattr(self.local, 'transport', None) is not None:
-            return
-        await super().setup_endpoint()
-        await self.bind(WG_GENL_NAME, wgmsg)    
-
-    async def info(self, interface=None, ifindex=None):
+    def info(self, interface=None, ifindex=None):
         msg = wgmsg()
         msg['cmd'] = WG_CMD_GET_DEVICE
 
@@ -257,18 +247,18 @@ class AsyncWireGuard(AsyncGenericNetlinkSocket):
         else:
             raise ValueError("ifname or ifindex are unset")
 
-        return await self.nlm_request(
-            msg, msg_type=self.prid, msg_flags=NLM_F_REQUEST | NLM_F_DUMP
+        return self.nlm_request(
+                msg, msg_type=self.prid, msg_flags=NLM_F_REQUEST | NLM_F_DUMP
         )
 
-    async def set(
-        self,
-        interface=None,
-        ifindex=None,
-        listen_port=None,
-        fwmark=None,
-        private_key=None,
-        peer=None,
+    def set(
+            self,
+            interface=None,
+            ifindex=None,
+            listen_port=None,
+            fwmark=None,
+            private_key=None,
+            peer=None
     ):
         msg = wgmsg()
 
@@ -300,7 +290,7 @@ class AsyncWireGuard(AsyncGenericNetlinkSocket):
         msg['header']['pid'] = self.pid
         msg.encode()
         self.sendto(msg.data, (0, 0))
-        (msg,) = [x async for x in self.get()]
+        msg = self.get()[0]
         err = msg['header'].get('error', None)
         if err is not None:
             if hasattr(err, 'code') and err.code == errno.ENOENT:
@@ -331,7 +321,7 @@ class AsyncWireGuard(AsyncGenericNetlinkSocket):
 
         # If peer removal is set to True
         if 'remove' in peer and peer['remove']:
-            attrs.append(['WGPEER_A_FLAGS', WGPEER_F_REMOVE_ME])
+            attrs.append(['WGPEER_A_FLAGS', WGDEVICE_F_REPLACE_PEERS])
             msg['attrs'].append(['WGDEVICE_A_PEERS', wg_peer])
             return
 
@@ -358,12 +348,7 @@ class AsyncWireGuard(AsyncGenericNetlinkSocket):
             attrs.append(['WGPEER_A_PERSISTENT_KEEPALIVE_INTERVAL', keepalive])
 
         # Set Peer flags
-        flags = 0
-        if 'update_only' in peer and peer['update_only']:
-            flags |= WGPEER_F_UPDATE_ONLY
-        if 'replace_allowed_ips' in peer and peer['replace_allowed_ips']:
-            flags |= WGPEER_F_REPLACE_ALLOWEDIPS
-        attrs.append(['WGPEER_A_FLAGS', flags])
+        attrs.append(['WGPEER_A_FLAGS', WGPEER_F_UPDATE_ONLY])
 
         # Set allowed IPs
         if 'allowed_ips' in peer:
@@ -395,29 +380,3 @@ class AsyncWireGuard(AsyncGenericNetlinkSocket):
             allowed_ip.append(['WGALLOWEDIP_A_CIDR_MASK', int(mask)])
 
         return ret
-
-
-class WireGuard(GenericNetlinkSocket):
-    async_class = AsyncWireGuard
-
-    def info(self, interface=None, ifindex=None):
-        return self._run_sync_cleanup(self.asyncore.info, interface, ifindex)
-
-    def set(
-        self,
-        interface=None,
-        ifindex=None,
-        listen_port=None,
-        fwmark=None,
-        private_key=None,
-        peer=None,
-    ):
-        return self._run_with_cleanup(
-            self.asyncore.set,
-            interface,
-            ifindex,
-            listen_port,
-            fwmark,
-            private_key,
-            peer,
-        )

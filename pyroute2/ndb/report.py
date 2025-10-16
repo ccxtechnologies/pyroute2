@@ -3,13 +3,10 @@
 
 .. testsetup::
 
-    from pyroute2 import config
     from pyroute2 import NDB
+    ndb = NDB(sources=[{'target': 'localhost', 'kind': 'IPMock'}])
 
-    config.mock_netlink = True
-    ndb = NDB()
-
-.. testcleanup::
+.. testcleanup:: *
 
     for key, value in tuple(globals().items()):
         if key.startswith('ndb') and hasattr(value, 'close'):
@@ -36,7 +33,10 @@ Filtering example:
 '''
 
 import json
-import sys
+import warnings
+from itertools import chain
+
+from pyroute2 import cli
 
 MAX_REPORT_LINES = 10000
 
@@ -178,18 +178,11 @@ class Record:
 
 
 class BaseRecordSet(object):
-    def __init__(self, source, ellipsis='(...)'):
-        self.source = source
-        self.generator = source
+    def __init__(self, generator, ellipsis='(...)'):
+        self.generator = generator
         self.ellipsis = ellipsis
-        self.materialized = None
-        self.filters = []
-        if hasattr(sys, 'ps1'):
-            self.materialize()
 
     def __iter__(self):
-        if self.materialized is not None:
-            self.generator = iter(self.materialized)
         return self
 
     def __next__(self):
@@ -218,8 +211,19 @@ class BaseRecordSet(object):
             ret.pop()
         return ''.join(ret)
 
-    def materialize(self):
-        self.materialized = tuple(self)
+
+class RecordSetConfig(dict):
+    def __init__(self, prime):
+        if isinstance(prime, dict):
+            for key, value in prime.items():
+                self[key] = value
+        else:
+            raise ValueError('only dict allowed')
+
+    def __setitem__(self, key, value):
+        if isinstance(value, str):
+            value = json.loads(value)
+        return super().__setitem__(key, value)
 
 
 class RecordSet(BaseRecordSet):
@@ -232,6 +236,11 @@ class RecordSet(BaseRecordSet):
     to make chains of filters.
     '''
 
+    def __init__(self, generator, config=None, ellipsis=True):
+        super().__init__(generator, ellipsis)
+        self.filters = []
+        self.config = RecordSetConfig(config) if config is not None else {}
+
     def __next__(self):
         while True:
             record = next(self.generator)
@@ -242,6 +251,7 @@ class RecordSet(BaseRecordSet):
             else:
                 return record
 
+    @cli.show_result
     def select_fields(self, *fields):
         '''
         Select only chosen fields for every record:
@@ -260,8 +270,10 @@ class RecordSet(BaseRecordSet):
             2,'eth0'
         '''
         self.filters.append(lambda x: x._select_fields(*fields))
-        return self
+        if self.config.get('recordset_pipe'):
+            return RecordSet(self, config=self.config)
 
+    @cli.show_result
     def select_records(self, f=None, **spec):
         '''
         Select records based on a function f() or a spec match. A spec
@@ -280,8 +292,10 @@ class RecordSet(BaseRecordSet):
             'localhost',0,'eth0','192.168.122.28',24
         '''
         self.filters.append(lambda x: x if x._match(f, **spec) else None)
-        return self
+        if self.config.get('recordset_pipe'):
+            return RecordSet(self, config=self.config)
 
+    @cli.show_result
     def transform_fields(self, **kwarg):
         '''
         Transform fields with a function. Function must accept
@@ -304,8 +318,83 @@ class RecordSet(BaseRecordSet):
             'eth0','192.168.122.28/24'
         '''
         self.filters.append(lambda x: x._transform_fields(**kwarg))
-        return self
+        if self.config.get('recordset_pipe'):
+            return RecordSet(self, config=self.config)
 
+    @cli.show_result
+    def transform(self, **kwarg):
+        warnings.warn(deprecation_notice, DeprecationWarning)
+
+        def g():
+            for record in self.generator:
+                if isinstance(record, Record):
+                    values = []
+                    names = record._names
+                    for name, value in zip(names, record._values):
+                        if name in kwarg:
+                            value = kwarg[name](value)
+                        values.append(value)
+                    record = Record(names, values, record._ref_class)
+                yield record
+
+        return RecordSet(g())
+
+    @cli.show_result
+    def filter(self, f=None, **kwarg):
+        warnings.warn(deprecation_notice, DeprecationWarning)
+
+        def g():
+            for record in self.generator:
+                m = True
+                for key in kwarg:
+                    if kwarg[key] != getattr(record, key):
+                        m = False
+                if m:
+                    if f is None:
+                        yield record
+                    elif f(record):
+                        yield record
+
+        return RecordSet(g())
+
+    @cli.show_result
+    def select(self, *argv):
+        warnings.warn(deprecation_notice, DeprecationWarning)
+        return self.fields(*argv)
+
+    @cli.show_result
+    def fields(self, *fields):
+        warnings.warn(deprecation_notice, DeprecationWarning)
+
+        def g():
+            for record in self.generator:
+                yield record._select_fields(*fields)
+
+        return RecordSet(g())
+
+    @cli.show_result
+    def join(self, right, condition=lambda r1, r2: True, prefix=''):
+        warnings.warn(deprecation_notice, DeprecationWarning)
+        # fetch all the records from the right
+        # ACHTUNG it may consume a lot of memory
+        right = tuple(right)
+
+        def g():
+            for r1 in self.generator:
+                for r2 in right:
+                    if condition(r1, r2):
+                        n = tuple(
+                            chain(
+                                r1._names,
+                                ['%s%s' % (prefix, x) for x in r2._names],
+                            )
+                        )
+                        v = tuple(chain(r1._values, r2._values))
+                        yield Record(n, v, r1._ref_class)
+
+        return RecordSet(g())
+
+    @cli.show_result
     def format(self, kind):
         '''
         Return an iterator over text lines in the chosen format.

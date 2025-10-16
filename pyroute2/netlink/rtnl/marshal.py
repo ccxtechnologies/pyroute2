@@ -7,7 +7,6 @@ from pyroute2.netlink.rtnl.ifstatsmsg import ifstatsmsg
 from pyroute2.netlink.rtnl.ndmsg import ndmsg
 from pyroute2.netlink.rtnl.ndtmsg import ndtmsg
 from pyroute2.netlink.rtnl.nsidmsg import nsidmsg
-from pyroute2.netlink.rtnl.probe_msg import probe_msg
 from pyroute2.netlink.rtnl.rtmsg import rtmsg
 from pyroute2.netlink.rtnl.tcmsg import tcmsg
 
@@ -49,7 +48,6 @@ class MarshalRtnl(Marshal):
         rtnl.RTM_GETSTATS: ifstatsmsg,
         rtnl.RTM_NEWLINKPROP: ifinfmsg,
         rtnl.RTM_DELLINKPROP: ifinfmsg,
-        rtnl.RTM_NEWPROBE: probe_msg,
     }
 
     def fix_message(self, msg):

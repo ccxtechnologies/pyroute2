@@ -4,7 +4,7 @@
 from enum import Enum
 
 from pyroute2.netlink import genlmsg
-from pyroute2.netlink.event import AsyncEventSocket, EventSocket
+from pyroute2.netlink.event import EventSocket
 from pyroute2.netlink.nlsocket import Marshal
 
 
@@ -69,10 +69,6 @@ class MarshalThermalEvent(Marshal):
     msg_map = {x.value: thermal_msg for x in ThermalGenlEvent}
 
 
-class AsyncThermalEventSocket(AsyncEventSocket):
+class ThermalEventSocket(EventSocket):
     marshal_class = MarshalThermalEvent
     genl_family = 'thermal'
-
-
-class ThermalEventSocket(EventSocket):
-    async_class = AsyncThermalEventSocket

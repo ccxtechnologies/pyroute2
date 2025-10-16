@@ -5,7 +5,7 @@
     from socket import AF_INET
     from pyroute2 import NDB
     from pyroute2 import config
-    config.mock_netlink = True
+    config.mock_iproute = True
     ndb = NDB()
 
 .. testcleanup:: *
@@ -140,7 +140,7 @@ Accessing one address details
 
 Access an address as a separate RTNL object:
 
-.. code::
+.. testcode:: x3
 
     print(ndb.addresses['192.168.122.28/24'])
 
@@ -159,14 +159,14 @@ only remove old ones, and create new.
 from pyroute2.netlink.rtnl.ifaddrmsg import ifaddrmsg
 from pyroute2.requests.address import AddressFieldFilter
 
-from ..objects import AsyncObject
+from ..objects import RTNL_Object
 
 
-async def load_ifaddrmsg(schema, sources, target, event):
+def load_ifaddrmsg(schema, target, event):
     #
     # bypass
     #
-    await schema.load_netlink('addresses', sources, target, event)
+    schema.load_netlink('addresses', target, event)
     #
     # last address removal should trigger routes flush
     # Bug-Url: https://github.com/svinota/pyroute2/issues/849
@@ -177,42 +177,24 @@ async def load_ifaddrmsg(schema, sources, target, event):
         #
         addresses = schema.execute(
             '''
-               SELECT * FROM addresses WHERE
-               f_target = ? AND
-               f_index = ? AND
-               f_family = 2
-            ''',
+                              SELECT * FROM addresses WHERE
+                              f_target = %s AND
+                              f_index = %s AND
+                              f_family = 2
+                              '''
+            % (schema.plch, schema.plch),
             (target, event['index']),
         ).fetchmany()
         if not len(addresses):
             schema.execute(
                 '''
-                   DELETE FROM routes WHERE
-                   f_target = ? AND
-                   f_RTA_OIF = ? OR
-                   f_RTA_IIF = ?
-                ''',
+                           DELETE FROM routes WHERE
+                           f_target = %s AND
+                           f_RTA_OIF = %s OR
+                           f_RTA_IIF = %s
+                           '''
+                % (schema.plch, schema.plch, schema.plch),
                 (target, event['index'], event['index']),
-            )
-            # Take care of multipath routes
-            schema.execute(
-                '''
-                   DELETE FROM nh WHERE
-                   f_target = ? AND
-                   f_oif = ?
-                ''',
-                (target, event['index']),
-            )
-
-            schema.execute(
-                '''
-                   DELETE FROM routes WHERE
-                   f_target = ? AND
-                   f_deps = 1 AND
-                   f_route_id NOT IN
-                   (SELECT n.f_route_id FROM nh n)
-                ''',
-                (target,),
             )
 
 
@@ -233,7 +215,7 @@ init = {
 }
 
 
-class Address(AsyncObject):
+class Address(RTNL_Object):
     table = 'addresses'
     msg_class = ifaddrmsg
     field_filter = AddressFieldFilter
@@ -242,23 +224,28 @@ class Address(AsyncObject):
     @classmethod
     def _count(cls, view):
         if view.chain:
-            return view.ndb.schema.fetchone(
-                f'SELECT count(*) FROM {view.table} WHERE f_index = ?',
+            return view.ndb.task_manager.db_fetchone(
+                'SELECT count(*) FROM %s WHERE f_index = %s'
+                % (view.table, view.ndb.schema.plch),
                 [view.chain['index']],
             )
         else:
-            return view.ndb.schema.fetchone(
-                f'SELECT count(*) FROM {view.table}'
+            return view.ndb.task_manager.db_fetchone(
+                'SELECT count(*) FROM %s' % view.table
             )
 
     @classmethod
     def _dump_where(cls, view):
         if view.chain:
+            plch = view.ndb.schema.plch
             where = '''
-                       WHERE
-                           main.f_target = ? AND
-                           main.f_index = ?
-                    '''
+                    WHERE
+                        main.f_target = %s AND
+                        main.f_index = %s
+                    ''' % (
+                plch,
+                plch,
+            )
             values = [view.chain['target'], view.chain['index']]
         else:
             where = ''
@@ -281,16 +268,18 @@ class Address(AsyncObject):
               '''
         yield ('target', 'tflags', 'ifname', 'address', 'prefixlen')
         where, values = cls._dump_where(view)
-        for record in view.ndb.schema.fetch(req + where, values):
+        for record in view.ndb.task_manager.db_fetch(req + where, values):
             yield record
 
     def mark_tflags(self, mark):
+        plch = (self.schema.plch,) * 3
         self.schema.execute(
             '''
-               UPDATE interfaces SET
-                   f_tflags = ?
-               WHERE f_index = ? AND f_target = ?
-            ''',
+                            UPDATE interfaces SET
+                                f_tflags = %s
+                            WHERE f_index = %s AND f_target = %s
+                            '''
+            % plch,
             (mark, self['index'], self['target']),
         )
 
@@ -308,7 +297,7 @@ class Address(AsyncObject):
             )
 
     @classmethod
-    def spec_normalize(cls, spec):
+    def spec_normalize(cls, processed, spec):
         '''
         Address key normalization::
 
@@ -317,8 +306,8 @@ class Address(AsyncObject):
                                 "prefixlen": 24}
         '''
         if isinstance(spec, str):
-            return {'address': spec}
-        return spec
+            processed['address'] = spec
+        return processed
 
     def key_repr(self):
         return '%s/%s %s/%s' % (

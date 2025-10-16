@@ -27,10 +27,11 @@ See also: :ref:`iproute`
 
 .. testsetup::
 
-    from pyroute2 import IPRoute, NDB
+    from pyroute2 import IPMock as IPRoute
+    from pyroute2 import NDB
     from pyroute2 import config
 
-    config.mock_netlink = True
+    config.mock_iproute = True
 
 .. testcode::
 
@@ -61,7 +62,6 @@ API
 ===
 '''
 
-import asyncio
 import collections
 import errno
 import json
@@ -69,16 +69,16 @@ import threading
 import time
 import traceback
 import weakref
-from enum import IntFlag
 from functools import partial
-from typing import Awaitable, Callable, Union
 
+from pyroute2 import cli
 from pyroute2.netlink.exceptions import NetlinkError
 from pyroute2.requests.main import RequestProcessor
 
+from ..auth_manager import AuthManager, check_auth
 from ..events import InvalidateHandlerException, State
+from ..messages import cmsg_event
 from ..report import Record
-from ..sync_api import SyncBase
 
 RSLV_IGNORE = 0
 RSLV_RAISE = 1
@@ -86,30 +86,30 @@ RSLV_NONE = 2
 RSLV_DELETE = 3
 
 
-# FIXME:3.9: TypeAlias
-# FIXME 3.9: Union
-Req = dict[str, Union[str, int]]
-
-
-async def fallback_add(self, idx_req, req):
+def fallback_add(self, idx_req, req):
     # ignore all set/get for objects with incomplete idx_req
     if set(idx_req.keys()) != set(self.kspec):
         self.log.debug('ignore incomplete idx_req in the fallback')
         return
     # try to set the object
-    self.sources[self['target']].api(self.api, 'set', **req)
+    (
+        self.ndb._event_queue.put(
+            self.sources[self['target']].api(self.api, 'set', **req),
+            source=self['target'],
+        )
+    )
     # try to get the object
-    self.sources[self['target']].api(self.api, 'get', **idx_req)
+    (
+        self.ndb._event_queue.put(
+            self.sources[self['target']].api(self.api, 'get', **idx_req),
+            source=self['target'],
+        )
+    )
     # reload the collected data
     self.load_sql()
 
 
-class ObjectFlags(IntFlag):
-    UNSPEC = 0x0
-    SNAPSHOT = 0x1
-
-
-class AsyncObject(dict):
+class RTNL_Object(dict):
     '''
     The common base class for NDB objects -- interfaces, routes, rules
     addresses etc. Implements common logic for all the classes, like
@@ -215,7 +215,9 @@ class AsyncObject(dict):
     #
     @classmethod
     def _count(cls, view):
-        return view.ndb.schema.fetchone('SELECT count(*) FROM %s' % view.table)
+        return view.ndb.task_manager.db_fetchone(
+            'SELECT count(*) FROM %s' % view.table
+        )
 
     @classmethod
     def _dump_where(cls, view):
@@ -231,7 +233,7 @@ class AsyncObject(dict):
         )
         yield names
         where, values = cls._dump_where(view)
-        for record in view.ndb.schema.fetch(req + where, values):
+        for record in view.ndb.task_manager.db_fetch(req + where, values):
             yield record
 
     @classmethod
@@ -251,8 +253,8 @@ class AsyncObject(dict):
         )
 
     @classmethod
-    def spec_normalize(cls, spec):
-        return spec
+    def spec_normalize(cls, processed, spec):
+        return processed
 
     @staticmethod
     def key_load_context(key, context):
@@ -267,11 +269,11 @@ class AsyncObject(dict):
         load=True,
         master=None,
         check=True,
-        flags=ObjectFlags.UNSPEC,
+        auth_managers=None,
     ):
         self.view = view
         self.ndb = view.ndb
-        self.sources = view.ndb.sources.asyncore
+        self.sources = view.ndb.sources
         self.master = master
         self.ctxid = ctxid
         self.schema = view.ndb.schema
@@ -280,20 +282,22 @@ class AsyncObject(dict):
         self.iclass = iclass
         self.utable = self.utable or self.table
         self.errors = []
-        self.flags = flags
         self.atime = time.time()
         self.log = self.ndb.log.channel('rtnl_object')
         self.log.debug('init')
+        if auth_managers is None:
+            auth_managers = [AuthManager(None, self.ndb.log.channel('auth'))]
+        self.auth_managers = auth_managers
         self.state = State()
         self.state.set('invalid')
         self.snapshot_deps = []
-        self.load_event = asyncio.Event()
-        self.evq = self.ndb.task_manager.event_queue
+        self.load_event = threading.Event()
         self.load_event.set()
         self.load_debug = False
         self.lock = threading.Lock()
-        self.object_data = RequestProcessor(context=weakref.proxy(self))
-        self.object_data.add_filter(self.field_filter())
+        self.object_data = RequestProcessor(
+            self.field_filter(), context=weakref.proxy(self)
+        )
         self.kspec = self.schema.compiled[self.table]['idx']
         self.knorm = self.schema.compiled[self.table]['norm_idx']
         self.spec = self.schema.compiled[self.table]['all_names']
@@ -347,15 +351,12 @@ class AsyncObject(dict):
     def new_spec(cls, spec, context=None, localhost=None):
         if isinstance(spec, Record):
             spec = spec._as_dict()
-        spec = cls.spec_normalize(spec)
-        rp = RequestProcessor(context=spec)
-        rp.add_filter(cls.field_filter())
-        rp.update(spec)
+        rp = RequestProcessor(cls.field_filter(), context=spec, prime=spec)
         if isinstance(context, dict):
             rp.update(context)
         if 'target' not in rp and localhost is not None:
             rp['target'] = localhost
-        return rp
+        return cls.spec_normalize(rp, spec)
 
     @staticmethod
     def resolve(view, spec, fields, policy=RSLV_IGNORE):
@@ -417,9 +418,11 @@ class AsyncObject(dict):
     def __hash__(self):
         return id(self)
 
+    @check_auth('obj:read')
     def __getitem__(self, key):
         return dict.__getitem__(self, key)
 
+    @check_auth('obj:modify')
     def __setitem__(self, key, value):
         for nkey, nvalue in self.object_data.filter(key, value).items():
             if self.get(nkey) == nvalue:
@@ -429,7 +432,9 @@ class AsyncObject(dict):
                     self.log.debug(
                         f'prepare replace {nkey} = {nvalue} in {self.key}'
                     )
-                    self._replace = type(self)(self.view, self.key)
+                    self._replace = type(self)(
+                        self.view, self.key, auth_managers=self.auth_managers
+                    )
                     self.state.set('replace')
                 else:
                     raise ValueError(
@@ -450,6 +455,7 @@ class AsyncObject(dict):
     def key_repr(self):
         return repr(self.key)
 
+    @cli.change_pointer
     def create(self, **spec):
         '''
         Create an RTNL object of the same type, and add it to the
@@ -483,6 +489,8 @@ class AsyncObject(dict):
         spec['ndb_chain'] = self
         return self.view[spec]
 
+    @cli.show_result
+    @check_auth('obj:read')
     def show(self, fmt=None):
         '''
         Return the object in a specified format. The format may be
@@ -556,7 +564,8 @@ class AsyncObject(dict):
                 )
             )
 
-    async def snapshot(self, ctxid=None):
+    @check_auth('obj:modify')
+    def snapshot(self, ctxid=None):
         '''
         Create and return a snapshot of the object. The method creates
         corresponding SQL tables for the object itself and for detected
@@ -571,10 +580,11 @@ class AsyncObject(dict):
         else:
             key = self._replace.key
         snp = type(self)(
-            self.view, key, ctxid=ctxid, flags=ObjectFlags.SNAPSHOT
+            self.view, key, ctxid=ctxid, auth_managers=self.auth_managers
         )
-        snp.register()
-        self.ndb.schema.save_deps(ctxid, weakref.ref(snp), self.iclass)
+        self.ndb.task_manager.db_save_deps(
+            ctxid, weakref.ref(snp), self.iclass
+        )
         snp.changed = set(self.changed)
         return snp
 
@@ -591,7 +601,7 @@ class AsyncObject(dict):
 
         It is an internal method and is not supposed to be used externally.
         '''
-        self.log.debug(f'complete key {key} from table {self.etable}')
+        self.log.debug('complete key %s from table %s' % (key, self.etable))
         fetch = []
         if isinstance(key, Record):
             key = key._as_dict()
@@ -607,7 +617,7 @@ class AsyncObject(dict):
 
         for name in self.kspec:
             if name not in key:
-                fetch.append(f'f_{name}')
+                fetch.append('f_%s' % name)
 
         if fetch:
             keys = []
@@ -617,9 +627,9 @@ class AsyncObject(dict):
                 if nla_name in self.spec:
                     name = nla_name
                 if value is not None and name in self.spec:
-                    keys.append(f'f_{name} = ?')
+                    keys.append('f_%s = %s' % (name, self.schema.plch))
                     values.append(value)
-            spec = self.ndb.schema.fetchone(
+            spec = self.ndb.task_manager.db_fetchone(
                 'SELECT %s FROM %s WHERE %s'
                 % (' , '.join(fetch), self.etable, ' AND '.join(keys)),
                 values,
@@ -630,7 +640,7 @@ class AsyncObject(dict):
             for name, value in zip(fetch, spec):
                 key[name[2:]] = value
 
-        self.log.debug(f'got {key}')
+        self.log.debug('got %s' % key)
         return key
 
     def exists(self, key):
@@ -639,7 +649,8 @@ class AsyncObject(dict):
         '''
         return self.view.exists(key)
 
-    async def rollback(self, snapshot=None):
+    @check_auth('obj:modify')
+    def rollback(self, snapshot=None):
         '''
         Try to rollback the object state using the snapshot provided as
         an argument or using `self.last_save`.
@@ -648,7 +659,9 @@ class AsyncObject(dict):
             self.log.debug(
                 'rollback replace: %s :: %s' % (self.key, self._replace.key)
             )
-            new_replace = type(self)(self.view, self.key)
+            new_replace = type(self)(
+                self.view, self.key, auth_managers=self.auth_managers
+            )
             new_replace.state.set('remove')
             self.state.set('replace')
             self.update(self._replace)
@@ -656,16 +669,13 @@ class AsyncObject(dict):
         self.log.debug('rollback: %s' % str(self.state.events))
         snapshot = snapshot or self.last_save
         if snapshot == -1:
-            self.remove()
-            await self.apply()
-            return
+            return self.remove().apply()
         else:
             snapshot.state.set(self.state.get())
             snapshot.rollback_chain = self._apply_script_snapshots
-            snapshot.flags &= ~ObjectFlags.SNAPSHOT
-            await snapshot.apply(rollback=True)
+            snapshot.apply(rollback=True)
             for link, snp in snapshot.snapshot_deps:
-                await link.rollback(snapshot=snp)
+                link.rollback(snapshot=snp)
             return self
 
     def clear(self):
@@ -679,7 +689,8 @@ class AsyncObject(dict):
             and not self._apply_script
         )
 
-    async def commit(self):
+    @check_auth('obj:modify')
+    def commit(self):
         '''
         Commit the pending changes. If an exception is raised during
         `commit()`, automatically `rollback()` to the latest saved snapshot.
@@ -688,7 +699,7 @@ class AsyncObject(dict):
             return self
 
         if self.chain:
-            await self.chain.commit()
+            self.chain.commit()
         self.log.debug('commit: %s' % str(self.state.events))
         # Is it a new object?
         if self.state == 'invalid':
@@ -696,7 +707,7 @@ class AsyncObject(dict):
             save = dict(self)
             self.last_save = -1
             try:
-                return await self.apply(mode='commit')
+                return self.apply(mode='commit')
             except Exception as e_i:
                 # Save the debug info
                 e_i.trace = traceback.format_exc()
@@ -716,17 +727,17 @@ class AsyncObject(dict):
         # variable will be saved in the traceback, so the tables will be
         # available to debug. If the traceback will be saved somewhere then
         # the tables will never be dropped by the GC, so you can do it
-        # manually by `ndb.schema.purge_snapshots()` -- to invalidate
+        # manually by `ndb.task_manager.db_purge_snapshots()` -- to invalidate
         # all the snapshots and to drop the associated tables.
 
-        self.last_save = await self.snapshot()
+        self.last_save = self.snapshot()
         # Apply the changes
         try:
-            await self.apply(mode='commit')
+            self.apply(mode='commit')
         except Exception as e_c:
             # Rollback in the case of any error
             try:
-                await self.rollback()
+                self.rollback()
             except Exception as e_r:
                 e_c.chain = [e_r]
                 if hasattr(e_r, 'chain'):
@@ -785,10 +796,10 @@ class AsyncObject(dict):
         conditions = []
         values = []
         for name in self.kspec:
-            conditions.append(f'f_{name} = ?')
+            conditions.append('f_%s = %s' % (name, self.schema.plch))
             values.append(self.get(self.iclass.nla2name(name), None))
         return (
-            self.ndb.schema.fetchone(
+            self.ndb.task_manager.db_fetchone(
                 '''
                           SELECT count(*) FROM %s WHERE %s
                           '''
@@ -797,29 +808,31 @@ class AsyncObject(dict):
             )
         )[0]
 
-    async def hook_apply(self, method, **spec):
+    def hook_apply(self, method, **spec):
         pass
 
-    async def save_context(self):
+    @check_auth('obj:modify')
+    def save_context(self):
         if self.state == 'invalid':
             self.last_save = -1
         else:
-            self.last_save = await self.snapshot()
+            self.last_save = self.snapshot()
         return self
 
-    async def apply(self, rollback=False, req_filter=None, mode='apply'):
+    @check_auth('obj:modify')
+    def apply(self, rollback=False, req_filter=None, mode='apply'):
         '''
         Apply the pending changes. If an exception is raised during
         `apply()`, no `rollback()` is called. No automatic snapshots
-        are made.
+        are madre.
 
         In order to properly revert the changes, you have to run::
 
-            await obj.save_context()
+            obj.save_context()
             try:
-                await obj.apply()
+                obj.apply()
             except Exception:
-                await obj.rollback()
+                obj.rollback()
         '''
 
         # Resolve the fields
@@ -837,7 +850,7 @@ class AsyncObject(dict):
 
         # Load the current state
         try:
-            self.schema.commit()
+            self.task_manager.db_commit()
         except Exception:
             pass
         self.load_sql(set_state=False)
@@ -887,11 +900,11 @@ class AsyncObject(dict):
         for itn in range(10):
             try:
                 self.log.debug('API call %s (%s)' % (method, req))
-                await self.sources[self['target']].api(self.api, method, **req)
+                (self.sources[self['target']].api(self.api, method, **req))
                 first_call_success = True
-                await self.hook_apply(method, **req)
+                (self.hook_apply(method, **req))
             except NetlinkError as e:
-                self.log.debug('error: %s' % e)
+                (self.log.debug('error: %s' % e))
                 if not first_call_success:
                     self.log.debug('error on the first API call, escalate')
                     raise
@@ -914,13 +927,13 @@ class AsyncObject(dict):
                             if isinstance(
                                 self.fallback_for[method][e.code], str
                             ):
-                                await self.sources[self['target']].api(
+                                self.sources[self['target']].api(
                                     self.api,
                                     self.fallback_for[method][e.code],
                                     **req,
                                 )
                             else:
-                                await self.fallback_for[method][e.code](
+                                self.fallback_for[method][e.code](
                                     self, idx_req, req
                                 )
                         except NetlinkError:
@@ -945,14 +958,11 @@ class AsyncObject(dict):
                 self.log.debug('checked')
                 break
             self.log.debug('check failed')
-            try:
-                await asyncio.wait_for(self.load_event.wait(), 1)
-            except asyncio.TimeoutError:
-                pass
+            self.load_event.wait(wtime)
             self.load_event.clear()
         else:
             self.log.debug('stats: %s apply %s fail' % (id(self), method))
-            if not await self.use_db_resync(lambda x: x, self.check):
+            if not self.use_db_resync(lambda x: x, self.check):
                 self._apply_script = []
                 raise Exception('could not apply the changes')
 
@@ -960,7 +970,7 @@ class AsyncObject(dict):
         #
         if state == 'replace':
             self._replace.remove()
-            await self._replace.apply()
+            self._replace.apply()
         #
         if rollback:
             #
@@ -970,7 +980,7 @@ class AsyncObject(dict):
                     continue
                 table = cls.table
                 # comprare the tables
-                diff = self.ndb.schema.fetch(
+                diff = self.ndb.task_manager.db_fetch(
                     '''
                     SELECT * FROM %s_%s
                       EXCEPT
@@ -998,18 +1008,18 @@ class AsyncObject(dict):
                     obj.state.set('invalid')
                     obj.register()
                     try:
-                        await obj.apply()
+                        obj.apply()
                     except Exception as e:
                         self.errors.append((time.time(), obj, e))
             for obj in reversed(self.rollback_chain):
-                await obj.rollback()
+                obj.rollback()
         else:
             apply_script = self._apply_script
             self._apply_script = []
             for op, kwarg in apply_script:
                 kwarg['self'] = self
                 kwarg['mode'] = mode
-                ret = await self.use_db_resync(
+                ret = self.use_db_resync(
                     lambda x: not isinstance(x, KeyError), op, tuple(), kwarg
                 )
                 if not isinstance(ret, list):
@@ -1021,28 +1031,34 @@ class AsyncObject(dict):
                         self._apply_script_snapshots.append(obj)
         return self
 
-    async def use_db_resync(self, criteria, method, argv=None, kwarg=None):
+    def use_db_resync(self, criteria, method, argv=None, kwarg=None):
         ret = None
         argv = argv or []
         kwarg = kwarg or {}
         self.log.debug(f'criteria {criteria}')
         self.log.debug(f'method {method}, {argv}, {kwarg}')
         for attempt in range(3):
-            ret = []
-            for k in method(*argv, **kwarg):
-                if isinstance(k, Awaitable):
-                    k = await k
-                ret.append(k)
+            ret = method(*argv, **kwarg)
             self.log.debug(f'ret {ret}')
             if criteria(ret):
                 self.log.debug('criteria matched')
                 return ret
             self.log.debug(f'resync the DB attempt {attempt}')
-            self.ndb.schema.flush(self['target'])
+            self.ndb.task_manager.db_flush(self['target'])
             self.load_event.clear()
-            await self.sources[self['target']].api('dump')
-            # await self.evq.put(cmsg_event(self['target'], self.load_event))
-            await self.load_event.wait()
+            (
+                self.ndb._event_queue.put(
+                    self.sources[self['target']].api('dump'),
+                    source=self['target'],
+                )
+            )
+            (
+                self.ndb._event_queue.put(
+                    (cmsg_event(self['target'], self.load_event),),
+                    source=self['target'],
+                )
+            )
+            self.load_event.wait(self.wtime(1))
             self.load_event.clear()
         return ret
 
@@ -1086,6 +1102,7 @@ class AsyncObject(dict):
         '''
         Load the data from the database.
         '''
+
         if not self.key:
             return
 
@@ -1098,12 +1115,12 @@ class AsyncObject(dict):
         values = []
 
         for name, value in self.key.items():
-            keys.append(f'f_{name} = ?')
+            keys.append('f_%s = %s' % (name, self.schema.plch))
             if isinstance(value, (list, tuple, dict)):
                 value = json.dumps(value)
             values.append(value)
 
-        spec = self.ndb.schema.fetchone(
+        spec = self.ndb.task_manager.db_fetchone(
             'SELECT * FROM %s WHERE %s' % (table, ' AND '.join(keys)), values
         )
         self.log.debug('load_sql load: %s' % str(spec))
@@ -1120,21 +1137,17 @@ class AsyncObject(dict):
                     self.state.set('system')
         return spec
 
-    async def load_rtnlmsg(self, sources, target, event):
+    def load_rtnlmsg(self, target, event):
         '''
         Check if the RTNL event matches the object and load the
         data from the database if it does.
         '''
         # TODO: partial match (object rename / restore)
         # ...
-        if ObjectFlags.SNAPSHOT in self.flags:
-            return
 
         # full match
         for norm, name in zip(self.knorm, self.kspec):
             value = self.get(norm)
-            if value is None:
-                continue
             if name == 'target':
                 if value != target:
                     return
@@ -1150,102 +1163,3 @@ class AsyncObject(dict):
         else:
             self.load_sql()
         self.load_event.set()
-
-
-class RTNL_Object(SyncBase):
-
-    # FIXME 3.9: Union
-    def apply(
-        self,
-        rollback: bool = False,
-        req_filter: Union[None, Callable[[Req], Req]] = None,
-        mode: str = 'apply',
-    ) -> SyncBase:
-        self._main_async_call(self.asyncore.apply, rollback, req_filter, mode)
-        return self
-
-    @property
-    def state(self):
-        return self.asyncore.state
-
-    @property
-    def chain(self):
-        return self._get_sync_class(
-            self.asyncore.chain, key=self.asyncore.chain.table
-        )
-
-    @property
-    def table(self):
-        return self.asyncore.table
-
-    @property
-    def etable(self):
-        return self.asyncore.etable
-
-    @property
-    def key(self):
-        return self.asyncore.key
-
-    def complete_key(self, key):
-        return self._main_sync_call(self.asyncore.complete_key, key)
-
-    def exists(self, key):
-        return self._main_sync_call(self.asyncore.exists, key)
-
-    def load_sql(self, table=None, ctxid=None, set_state=True):
-        return self._main_sync_call(
-            self.asyncore.load_sql, table, ctxid, set_state
-        )
-
-    def load_value(self, key, value):
-        return self._main_sync_call(self.asyncore.load_value, key, value)
-
-    def snapshot(self, ctxid=None):
-        return self._main_async_call(self.asyncore.snapshot, ctxid)
-
-    def create(self, **spec):
-        item = self._main_sync_call(self.asyncore.create, **spec)
-        return type(self)(self.event_loop, item)
-
-    def commit(self) -> SyncBase:
-        self._main_async_call(self.asyncore.commit)
-        return self
-
-    def rollback(self, snapshot=None):
-        self._main_async_call(self.asyncore.rollback, snapshot)
-        return self
-
-    def show(self, fmt=None):
-        return self.asyncore.show(fmt)
-
-    def keys(self):
-        return self.asyncore.keys()
-
-    def items(self):
-        return self.asyncore.items()
-
-    def set(self, *argv, **kwarg):
-        self._main_sync_call(self.asyncore.set, *argv, **kwarg)
-        return self
-
-    def get(self, key, *argv):
-        return self.asyncore.get(key, *argv)
-
-    def remove(self):
-        self.asyncore.remove()
-        return self
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, ext_type, exc_value, traceback):
-        self.commit()
-
-    def __repr__(self):
-        return repr(self.asyncore)
-
-    def __getitem__(self, key):
-        return self.asyncore[key]
-
-    def __setitem__(self, key, value):
-        return self.set(key, value)

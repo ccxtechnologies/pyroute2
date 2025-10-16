@@ -1,4 +1,3 @@
-from pyroute2.netlink.rt_files import EmatchMapFile
 from pyroute2.netlink.rtnl.tcmsg import em_cmp, em_ipset, em_meta
 
 plugins = {
@@ -82,10 +81,7 @@ def get_tcf_ematches(kwarg):
         cur_match = kwarg['match'][i]
 
         # Translate string kind into numeric kind
-        try:
-            kind = plugins_translate[cur_match['kind']]
-        except KeyError:
-            kind = EmatchMapFile().get_rt_id(cur_match['kind'])
+        kind = plugins_translate[cur_match['kind']]
         match['kind'] = kind
         data = plugins[kind].data()
         data.setvalue(cur_match)

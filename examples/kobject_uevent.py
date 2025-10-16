@@ -1,5 +1,4 @@
 from pprint import pprint
-
 from pyroute2 import UeventSocket
 
 kus = UeventSocket()

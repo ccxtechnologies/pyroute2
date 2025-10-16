@@ -20,12 +20,8 @@ Usage
     :maxdepth: 2
 
     usage
-    asyncio
-    threading
     iproute
     ndb
-    fixtures
-    plan9
     wiset
     ipset
     netns
@@ -49,7 +45,6 @@ Man pages
 
    pyroute2-cli
    pyroute2-dhcp-client
-   dhcp-server-detector
 
 Development
 -----------
@@ -61,14 +56,23 @@ Development
     arch
     parser
     netlink
+    nlsocket
+
+Experimental
+------------
+
+.. toctree::
+   :maxdepth: 1
+
+   remote
 
 Deprecated
 ----------
 
 .. toctree::
-    :maxdepth: 1
+   :maxdepth: 1
 
-    deprecated
+   ipdb_toc
 
 Indices and tables
 ==================
