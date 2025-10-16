@@ -10,11 +10,8 @@ permissions:
 
 jobs:
   build:
-    runs-on: Fedora
-    strategy:
-      matrix:
-        python: [python3.9, python3.14]
+    runs-on: code
     steps:
       - run: sudo chown -R $USER:$USER $GITHUB_WORKSPACE
       - uses: actions/checkout@v4
-      - run: make nox session=linter-${{ matrix.python }}
+      - run: make nox session=linter

@@ -47,10 +47,7 @@ def test_multiple_sources(context):
     # NDB() object from the code block above, check
     # that all the sources are closed too
     for source in ndb.sources:
-        #
-        # a closed event loop will raise RuntimeError
-        with pytest.raises(RuntimeError):
-            assert ndb.sources[source]
+        assert ndb.sources[source].nl.closed
 
 
 @pytest.mark.parametrize('context', test_matrix, indirect=True)
@@ -159,7 +156,7 @@ def test_source_netns_restart(context):
 
 def count_interfaces(ndb, target):
     return (
-        ndb.db.fetchone(
+        ndb.task_manager.db_fetchone(
             '''
                       SELECT count(*) FROM interfaces
                       WHERE

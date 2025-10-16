@@ -20,10 +20,10 @@ from pyroute2.netlink import (
     SOL_NETLINK,
     ctrlmsg,
 )
-from pyroute2.netlink.nlsocket import AsyncNetlinkSocket, NetlinkSocket
+from pyroute2.netlink.nlsocket import NetlinkSocket
 
 
-class AsyncGenericNetlinkSocket(AsyncNetlinkSocket):
+class GenericNetlinkSocket(NetlinkSocket):
     '''
     Low-level socket interface. Provides all the
     usual socket does, can be used in poll/select,
@@ -45,24 +45,16 @@ class AsyncGenericNetlinkSocket(AsyncNetlinkSocket):
         else:
             return self._prid
 
-    async def _do_dump(self, msg, msg_flags=NLM_F_REQUEST | NLM_F_DUMP):
-        return await self.nlm_request(
-            msg, msg_type=self.prid, msg_flags=msg_flags
-        )
-
-    async def _do_request(self, msg, msg_flags=NLM_F_REQUEST | NLM_F_ACK):
-        return [x async for x in await self._do_dump(msg, msg_flags)]
-
-    async def bind(self, proto, msg_class, groups=0, pid=None, **kwarg):
+    def bind(self, proto, msg_class, groups=0, pid=None, **kwarg):
         '''
         Bind the socket and performs generic netlink
         proto lookup. The `proto` parameter is a string,
         like "TASKSTATS", `msg_class` is a class to
         parse messages with.
         '''
-        await super().bind(groups, pid, **kwarg)
+        NetlinkSocket.bind(self, groups, pid, **kwarg)
         self.marshal.msg_map[GENL_ID_CTRL] = ctrlmsg
-        msg = await self.discovery(proto)
+        msg = self.discovery(proto)
         self._prid = msg.get_attr('CTRL_ATTR_FAMILY_ID')
         self.mcast_groups = dict(
             [
@@ -85,7 +77,7 @@ class AsyncGenericNetlinkSocket(AsyncNetlinkSocket):
             SOL_NETLINK, NETLINK_DROP_MEMBERSHIP, self.mcast_groups[group]
         )
 
-    async def discovery(self, proto):
+    def discovery(self, proto):
         '''
         Resolve generic netlink protocol -- takes a string
         as the only parameter, return protocol description
@@ -99,7 +91,7 @@ class AsyncGenericNetlinkSocket(AsyncNetlinkSocket):
         msg['header']['pid'] = self.pid
         msg.encode()
         self.sendto(msg.data, (0, 0))
-        (msg,) = [x async for x in self.get()]
+        msg = self.get()[0]
         err = msg['header'].get('error', None)
         if err is not None:
             if hasattr(err, 'code') and err.code == errno.ENOENT:
@@ -112,7 +104,7 @@ class AsyncGenericNetlinkSocket(AsyncNetlinkSocket):
             raise err
         return msg
 
-    async def policy(self, proto):
+    def policy(self, proto):
         '''
         Extract policy information for a generic netlink protocol -- takes
         a string as the only parameter, return protocol policy
@@ -121,44 +113,14 @@ class AsyncGenericNetlinkSocket(AsyncNetlinkSocket):
         msg = ctrlmsg()
         msg['cmd'] = CTRL_CMD_GETPOLICY
         msg['attrs'].append(['CTRL_ATTR_FAMILY_NAME', proto])
-        return tuple(
-            [
-                x
-                async for x in await self.nlm_request(
-                    msg,
-                    msg_type=GENL_ID_CTRL,
-                    msg_flags=NLM_F_REQUEST | NLM_F_DUMP | NLM_F_ACK,
-                )
-            ]
+        return self.nlm_request(
+            msg,
+            msg_type=GENL_ID_CTRL,
+            msg_flags=NLM_F_REQUEST | NLM_F_DUMP | NLM_F_ACK,
         )
 
+    def get(self, *argv, **kwarg):
+        return tuple(super().get(*argv, **kwarg))
 
-class GenericNetlinkSocket(NetlinkSocket):
-
-    async_class = AsyncGenericNetlinkSocket
-    class_gen_sync = False
-
-    @property
-    def prid(self):
-        return self.asyncore.prid
-
-    @property
-    def mcast_groups(self):
-        return self.asyncore.mcast_groups
-
-    def bind(self, proto, msg_class, groups=0, pid=None, **kwarg):
-        return self._run_with_cleanup(
-            self.asyncore.bind, proto, msg_class, groups, pid, **kwarg
-        )
-
-    def add_membership(self, group):
-        return self.asyncore.add_membership(group)
-
-    def drop_membership(self, group):
-        return self.asyncore.drop_membership(group)
-
-    def discovery(self, proto):
-        return self._run_with_cleanup(self.asyncore.discovery, proto)
-
-    def policy(self, proto):
-        return self._run_with_cleanup(self.asyncore.policy, proto)
+    def nlm_request(self, *argv, **kwarg):
+        return tuple(super().nlm_request(*argv, **kwarg))

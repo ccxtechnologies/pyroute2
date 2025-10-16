@@ -4,7 +4,6 @@ from pyroute2.netlink.nfnetlink.nfctsocket import (
     IP_CT_TCP_FLAG_TO_NAME,
     IPSBIT_TO_NAME,
     TCP_CONNTRACK_TO_NAME,
-    AsyncNFCTSocket,
     NFCTAttrTuple,
     NFCTSocket,
 )
@@ -119,19 +118,22 @@ class ConntrackEntry(object):
         return s
 
 
-class AsyncConntrack(AsyncNFCTSocket):
+class Conntrack(NFCTSocket):
     """
     High level conntrack functions
     """
 
-    async def stat(self):
+    def __init__(self, nlm_generator=True, **kwargs):
+        super(Conntrack, self).__init__(nlm_generator=nlm_generator, **kwargs)
+
+    def stat(self):
         """Return current statistics per CPU
 
         Same result than conntrack -S command but a list of dictionaries
         """
         stats = []
 
-        for msg in await super().stat():
+        for msg in super(Conntrack, self).stat():
             stats.append({'cpu': msg['res_id']})
             stats[-1].update(
                 (k[10:].lower(), v)
@@ -141,73 +143,38 @@ class AsyncConntrack(AsyncNFCTSocket):
 
         return stats
 
-    async def count(self):
+    def count(self):
         """Return current number of conntrack entries
 
         Same result than /proc/sys/net/netfilter/nf_conntrack_count file
         or conntrack -C command
         """
-        for ndmsg in await super().count():
+        for ndmsg in super(Conntrack, self).count():
             return ndmsg.get_attr('CTA_STATS_GLOBAL_ENTRIES')
 
-    async def conntrack_max_size(self):
+    def conntrack_max_size(self):
         """
         Return the max size of connection tracking table
         /proc/sys/net/netfilter/nf_conntrack_max
         """
-        for ndmsg in await super().conntrack_max_size():
+        for ndmsg in super(Conntrack, self).conntrack_max_size():
             return ndmsg.get_attr('CTA_STATS_GLOBAL_MAX_ENTRIES')
 
-    async def delete(self, entry):
+    def delete(self, entry):
         if isinstance(entry, ConntrackEntry):
             tuple_orig = entry.tuple_orig
         elif isinstance(entry, NFCTAttrTuple):
             tuple_orig = entry
         else:
             raise NotImplementedError()
-        for ndmsg in await self.entry('del', tuple_orig=tuple_orig):
+        for ndmsg in self.entry('del', tuple_orig=tuple_orig):
             return ndmsg
 
-    async def entry(self, cmd, **kwarg):
-        for res in await super().entry(cmd, **kwarg):
+    def entry(self, cmd, **kwargs):
+        for res in super(Conntrack, self).entry(cmd, **kwargs):
             return res
 
-    async def _dump_entries_task(
-        self,
-        mark=None,
-        mark_mask=0xFFFFFFFF,
-        tuple_orig=None,
-        tuple_reply=None,
-    ):
-        async for ndmsg in await self.dump(
-            mark=mark,
-            mark_mask=mark_mask,
-            tuple_orig=tuple_orig,
-            tuple_reply=tuple_reply,
-        ):
-            if tuple_orig is not None and not tuple_orig.nla_eq(
-                ndmsg['nfgen_family'], ndmsg.get_attr('CTA_TUPLE_ORIG')
-            ):
-                continue
-
-            if tuple_reply is not None and not tuple_reply.nla_eq(
-                ndmsg['nfgen_family'], ndmsg.get_attr('CTA_TUPLE_REPLY')
-            ):
-                continue
-
-            yield ConntrackEntry(
-                ndmsg['nfgen_family'],
-                ndmsg.get_attr('CTA_TUPLE_ORIG'),
-                ndmsg.get_attr('CTA_TUPLE_REPLY'),
-                ndmsg.get_attr('CTA_STATUS'),
-                ndmsg.get_attr('CTA_TIMEOUT'),
-                ndmsg.get_attr('CTA_PROTOINFO'),
-                ndmsg.get_attr('CTA_MARK'),
-                ndmsg.get_attr('CTA_ID'),
-                ndmsg.get_attr('CTA_USE'),
-            )
-
-    async def dump_entries(
+    def dump_entries(
         self,
         mark=None,
         mark_mask=0xFFFFFFFF,
@@ -234,42 +201,30 @@ class AsyncConntrack(AsyncNFCTSocket):
                                              daddr='8.8.8.8')):
                 print("This entry is icmp to 8.8.8.8: {}".format(entry))
         """
-        return self._dump_entries_task(
-            mark, mark_mask, tuple_orig, tuple_reply
-        )
+        for ndmsg in self.dump(
+            mark=mark,
+            mark_mask=mark_mask,
+            tuple_orig=tuple_orig,
+            tuple_reply=tuple_reply,
+        ):
+            if tuple_orig is not None and not tuple_orig.nla_eq(
+                ndmsg['nfgen_family'], ndmsg.get_attr('CTA_TUPLE_ORIG')
+            ):
+                continue
 
+            if tuple_reply is not None and not tuple_reply.nla_eq(
+                ndmsg['nfgen_family'], ndmsg.get_attr('CTA_TUPLE_REPLY')
+            ):
+                continue
 
-class Conntrack(NFCTSocket):
-
-    def __init__(self, nlm_generator=True, **kwarg):
-        self.asyncore = AsyncConntrack(**kwarg)
-
-    def stat(self):
-        return self._run_with_cleanup(self.asyncore.stat)
-
-    def count(self):
-        return self._run_with_cleanup(self.asyncore.count)
-
-    def conntrack_max_size(self):
-        return self._run_with_cleanup(self.asyncore.conntrack_max_size)
-
-    def delete(self, entry):
-        return self._run_with_cleanup(self.asyncore.delete, entry)
-
-    def entry(self, cmd, **kwarg):
-        return self._run_with_cleanup(self.asyncore.entry, cmd, **kwarg)
-
-    def dump_entries(
-        self,
-        mark=None,
-        mark_mask=0xFFFFFFFF,
-        tuple_orig=None,
-        tuple_reply=None,
-    ):
-        return self._generate_with_cleanup(
-            self.asyncore.dump_entries,
-            mark,
-            mark_mask,
-            tuple_orig,
-            tuple_reply,
-        )
+            yield ConntrackEntry(
+                ndmsg['nfgen_family'],
+                ndmsg.get_attr('CTA_TUPLE_ORIG'),
+                ndmsg.get_attr('CTA_TUPLE_REPLY'),
+                ndmsg.get_attr('CTA_STATUS'),
+                ndmsg.get_attr('CTA_TIMEOUT'),
+                ndmsg.get_attr('CTA_PROTOINFO'),
+                ndmsg.get_attr('CTA_MARK'),
+                ndmsg.get_attr('CTA_ID'),
+                ndmsg.get_attr('CTA_USE'),
+            )

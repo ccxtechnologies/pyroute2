@@ -1,4 +1,5 @@
-from pyroute2 import IPRoute, NetNS
+from pyroute2.iproute.linux import IPRoute
+from pyroute2.nslink.nslink import NetNS
 
 
 def interface_exists(netns=None, *argv, **kwarg):

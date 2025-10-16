@@ -5,10 +5,10 @@ from pyroute2.common import basestring
 from pyroute2.netlink.rtnl.nsinfmsg import nsinfmsg
 from pyroute2.requests.netns import NetNSFieldFilter
 
-from ..objects import AsyncObject
+from ..objects import RTNL_Object
 
 
-async def load_nsinfmsg(schema, sources, target, event):
+def load_nsinfmsg(schema, target, event):
     #
     # check if there is corresponding source
     #
@@ -20,7 +20,7 @@ async def load_nsinfmsg(schema, sources, target, event):
         warnings.warn(
             'automatic netns sourcing is being refactored', DeprecationWarning
         )
-    await schema.load_netlink('netns', sources, target, event)
+    schema.load_netlink('netns', target, event)
 
 
 schema = nsinfmsg.sql_schema().unique_index('NSINFO_PATH')
@@ -32,7 +32,7 @@ init = {
 }
 
 
-class NetNS(AsyncObject):
+class NetNS(RTNL_Object):
     table = 'netns'
     msg_class = nsinfmsg
     table_alias = 'n'
@@ -45,17 +45,17 @@ class NetNS(AsyncObject):
         super(NetNS, self).__init__(*argv, **kwarg)
 
     @classmethod
-    def spec_normalize(cls, spec):
+    def spec_normalize(cls, processed, spec):
         if isinstance(spec, basestring):
-            spec = {'path': spec}
-        path = netns._get_netnspath(spec['path'])
+            processed['path'] = spec
+        path = netns._get_netnspath(processed['path'])
         # on Python3 _get_netnspath() returns bytes, not str, so
         # we have to decode it here in order to avoid issues with
         # cache keys and DB inserts
         if hasattr(path, 'decode'):
             path = path.decode('utf-8')
-        spec['path'] = path
-        return spec
+        processed['path'] = path
+        return processed
 
     def __setitem__(self, key, value):
         if self.state == 'system':

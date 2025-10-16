@@ -5,22 +5,14 @@
 #
 python ?= $(shell util/find_python.sh)
 platform := $(shell uname -s)
-releaseTag ?= $(shell git describe --tags --abbrev=0)
-releaseDescription := $(shell git tag -l -n1 ${releaseTag} | sed 's/[0-9. ]\+//')
-noxboot ?= ~/.venv-boot
 
 define nox
         {\
 		which nox 2>/dev/null || {\
-		    test -d ${noxboot} && \
-				{\
-					. ${noxboot}/bin/activate;\
-				} || {\
-					${python} -m venv ${noxboot};\
-					. ${noxboot}/bin/activate;\
-					pip install --upgrade pip;\
-					pip install nox;\
-				};\
+			python -m venv ~/.venv-boot/;\
+			. ~/.venv-boot/bin/activate;\
+			pip install --upgrade pip;\
+			pip install nox;\
 		};\
 		nox $(1) -- '${noxconfig}';\
 	}
@@ -35,21 +27,27 @@ all:
 	@echo \* install -- install lib into the system
 	@echo
 
-.PHONY: git-clean
-git-clean:
-	git clean -d -f -x
-	git remote prune origin
-	git branch --merged | grep -vE '(^\*| master )' >/tmp/merged-branches && \
-		( xargs git branch -d </tmp/merged-branches ) ||:
-
-.PHONY: clean
 clean:
-	@for i in `ip -o link | awk -F : '($$2 ~ /^ pr/) {print($$2)}'`; do sudo ip link del $$i; done
-	@rm -rf docs/html
-	@rm -rf docs/man
-	@rm -f tests/*.db
-	@rm -f tests/*.json
+	@for module in $(call list_modules); do $(call clean_module); done
+	@rm -f VERSION
 	@rm -rf dist build MANIFEST
+	@rm -f docs-build.log
+	@rm -f docs/general.rst
+	@rm -f docs/changelog.rst
+	@rm -f docs/makefile.rst
+	@rm -f docs/report.rst
+	@rm -rf docs/api
+	@rm -rf docs/html
+	@rm -rf docs/doctrees
+	@[ -z "${keep_coverage}" ] && rm -f  tests/.coverage ||:
+	@rm -rf tests/htmlcov
+	@[ -z "${keep_coverage}" ] && rm -rf tests/cover ||:
+	@rm -rf tests/examples
+	@rm -rf tests/bin
+	@rm -rf tests/pyroute2
+	@rm -f  tests/*xml
+	@rm -f  tests/tests.json
+	@rm -f  tests/tests.log
 	@rm -rf pyroute2.egg-info
 	@rm -rf tests-workspaces
 	@rm -f python-pyroute2.spec
@@ -85,14 +83,14 @@ docs/html:
 
 docs: install docs/html
 
-.PHONY: format
-format:
-	$(call nox,-e linter-$(shell basename ${python}))
+check_parameters:
+	@if [ ! -z "${skip_tests}" ]; then \
+		echo "'skip_tests' is deprecated, use 'skip=...' instead"; false; fi
 
-.PHONY: test nox
-test nox:
+.PHONY: test
+test:
 ifeq ($(platform), Linux)
-	$(call nox,-e ${session})
+	$(call nox,)
 else ifeq ($(platform), OpenBSD)
 	$(call nox,-e openbsd)
 else
@@ -110,15 +108,6 @@ pprint(TestCapsRtnl().collect())"
 upload: dist
 	$(call nox,-e upload)
 
-.PHONY: release
-release: dist
-	gh release create \
-		--verify-tag \
-		--title "${releaseDescription}" \
-		${releaseTag} \
-		./dist/*${releaseTag}*
-
-.PHONY: setup
 setup:
 	$(call process_templates)
 	@for module in $(call list_modules); do $(call deploy_license); done
@@ -147,4 +136,11 @@ uninstall: clean VERSION setup
 	$(call make_modules, uninstall)
 
 audit-imports:
-	findimports -n pyroute2 2>/dev/null | awk -f util/imports_dict.awk
+	for module in $(call list_modules); do \
+		echo $$module; \
+		findimports -n $$module/pr2modules/ 2>/dev/null | awk -f util/imports_dict.awk | awk '{printf("\t"$$0"\n")}'; \
+	done
+
+# deprecated:
+epydoc clean-version update-version force-version README.md setup.ini develop:
+	@echo Deprecated target, see README.make.md

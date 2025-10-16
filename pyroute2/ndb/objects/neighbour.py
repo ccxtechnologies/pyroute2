@@ -6,10 +6,10 @@ from pyroute2.netlink.rtnl.ndmsg import ndmsg
 from pyroute2.requests.neighbour import NeighbourFieldFilter
 
 from ..events import RescheduleException
-from ..objects import AsyncObject
+from ..objects import RTNL_Object
 
 
-async def load_ndmsg(schema, sources, target, event):
+def load_ndmsg(schema, target, event):
     #
     # ignore events with ifindex == 0
     #
@@ -26,14 +26,12 @@ async def load_ndmsg(schema, sources, target, event):
         # bypass for now
         #
         try:
-            await schema.load_netlink(
-                'af_bridge_fdb', sources, target, event, propagate=True
-            )
+            schema.load_netlink('af_bridge_fdb', target, event, propagate=True)
         except Exception:
             raise RescheduleException()
 
     else:
-        await schema.load_netlink('neighbours', sources, target, event)
+        schema.load_netlink('neighbours', target, event)
 
 
 ndmsg_schema = (
@@ -50,7 +48,7 @@ ndmsg_schema = (
 
 brmsg_schema = (
     ndmsg.sql_schema()
-    .unique_index('ifindex', 'flags', 'NDA_DST', 'NDA_LLADDR', 'NDA_VLAN')
+    .unique_index('ifindex', 'NDA_LLADDR', 'NDA_DST', 'NDA_VLAN')
     .constraint('NDA_LLADDR', "NOT NULL DEFAULT ''")
     .constraint('NDA_DST', "NOT NULL DEFAULT ''")
     .constraint('NDA_VLAN', "NOT NULL DEFAULT 0")
@@ -68,13 +66,17 @@ init = {
 }
 
 
-async def fallback_add(self, idx_req, req):
-    async for msg in await self.sources[self['target']].api(self.api, 'dump'):
-        await self.sources[self['target']].evq.put(msg)
+def fallback_add(self, idx_req, req):
+    (
+        self.ndb._event_queue.put(
+            self.sources[self['target']].api(self.api, 'dump'),
+            source=self['target'],
+        )
+    )
     self.load_sql()
 
 
-class Neighbour(AsyncObject):
+class Neighbour(RTNL_Object):
     table = 'neighbours'
     msg_class = ndmsg
     field_filter = NeighbourFieldFilter
@@ -83,23 +85,28 @@ class Neighbour(AsyncObject):
     @classmethod
     def _count(cls, view):
         if view.chain:
-            return view.ndb.schema.fetchone(
-                f'SELECT count(*) FROM {view.table} WHERE f_ifindex = ?',
+            return view.ndb.task_manager.db_fetchone(
+                'SELECT count(*) FROM %s WHERE f_ifindex = %s'
+                % (view.table, view.ndb.schema.plch),
                 [view.chain['index']],
             )
         else:
-            return view.ndb.schema.fetchone(
-                f'SELECT count(*) FROM {view.table}'
+            return view.ndb.task_manager.db_fetchone(
+                'SELECT count(*) FROM %s' % view.table
             )
 
     @classmethod
     def _dump_where(cls, view):
         if view.chain:
+            plch = view.ndb.schema.plch
             where = '''
-                       WHERE
-                           main.f_target = ? AND
-                           main.f_ifindex = ?
-                    '''
+                    WHERE
+                        main.f_target = %s AND
+                        main.f_ifindex = %s
+                    ''' % (
+                plch,
+                plch,
+            )
             values = [view.chain['target'], view.chain['index']]
         else:
             where = ''
@@ -122,7 +129,7 @@ class Neighbour(AsyncObject):
               '''
         yield ('target', 'tflags', 'ifname', 'lladdr', 'dst')
         where, values = cls._dump_where(view)
-        for record in view.ndb.schema.fetch(req + where, values):
+        for record in view.ndb.task_manager.db_fetch(req + where, values):
             yield record
 
     def __init__(self, *argv, **kwarg):

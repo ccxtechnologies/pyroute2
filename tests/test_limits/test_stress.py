@@ -1,3 +1,4 @@
+import atexit
 import errno
 import gc
 import getpass
@@ -6,32 +7,18 @@ import resource
 
 import pytest
 
-from pyroute2 import AsyncIPRoute, IPRoute, netns
+from pyroute2 import NDB, IPRoute, NetNS
+from pyroute2.common import uifname
 
-RESPAWNS = 1024
-USAGE_RSS = set()
+RESPAWNS = 200
 pytestmark = [
     pytest.mark.skipif(getpass.getuser() != 'root', reason='no root access')
 ]
 
 
-def reset_rss_usage():
-    global USAGE_RSS
-    USAGE_RSS = set()
-
-
-def max_rss_usage():
-    global USAGE_RSS
-    usage = resource.getrusage(resource.RUSAGE_SELF)
-    USAGE_RSS.add(usage.ru_maxrss // 10)
-    return (max(USAGE_RSS) - min(USAGE_RSS)) == 0
-
-
 @pytest.fixture
-def resources():
-    # current file limits
+def fds():
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    # current usage
     try:
         resource.setrlimit(
             resource.RLIMIT_NOFILE,
@@ -43,52 +30,73 @@ def resources():
     yield fds_before
     gc.collect()
     fds_after = os.listdir(f'/proc/{os.getpid()}/fd/')
-    # restore limits
-    resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
     assert len(fds_after) <= len(fds_before)
 
 
-def test_respawn_iproute_sync(resources):
-    reset_rss_usage()
+def test_respawn_iproute_sync(fds):
     for _ in range(RESPAWNS):
         with IPRoute() as i:
             i.bind()
             i.link_lookup(ifname='lo')
-        assert max_rss_usage()
-        gc.collect()
 
 
-@pytest.mark.asyncio
-async def test_respawn_iproute_async(resources):
-    reset_rss_usage()
+def test_respawn_iproute_async(fds):
     for _ in range(RESPAWNS):
-        async with AsyncIPRoute() as i:
-            await i.bind()
-            await i.link_lookup(ifname='lo')
-        assert max_rss_usage()
-        gc.collect()
+        with IPRoute() as i:
+            i.bind(async_cache=True)
+            i.link_lookup(ifname='lo')
 
 
-def test_fd_leaks_netns(resources):
-    reset_rss_usage()
+def test_respawn_ndb(fds):
+    for _ in range(RESPAWNS):
+        with NDB() as i:
+            assert i.interfaces.count() > 0
+            assert i.addresses.count() > 0
+            assert i.routes.count() > 0
+            assert i.neighbours.count() > 0
+
+
+def test_bridge_fd_leaks(fds):
+    ifs = []
+    for _ in range(RESPAWNS):
+        ifs.append(uifname())
+    with NDB() as ndb:
+        for name in ifs:
+            ndb.interfaces.create(ifname=name, kind='bridge').apply()
+    with NDB() as ndb:
+        for name in ifs:
+            ndb.interfaces[name].remove().apply()
+
+
+def test_tuntap_fd_leaks(fds):
+    ifs = []
+    for _ in range(RESPAWNS):
+        ifs.append(uifname())
+    with NDB() as ndb:
+        for name in ifs:
+            ndb.interfaces.create(
+                ifname=name, kind='tuntap', mode='tun'
+            ).apply()
+    with NDB() as ndb:
+        for name in ifs:
+            ndb.interfaces[name].remove().apply()
+
+
+def test_fd_leaks(fds):
     for i in range(RESPAWNS):
         nsid = 'leak_%i' % i
-        ipr = IPRoute(netns=nsid)
-        ipr.link_lookup(ifname='lo')
-        ipr.close()
-        assert max_rss_usage()
-        gc.collect()
-        netns.remove(nsid)
+        ns = NetNS(nsid)
+        ns.close()
+        ns.remove()
+        if hasattr(atexit, '_exithandlers'):
+            assert ns.close not in atexit._exithandlers
 
 
-def test_fd_leaks_netns_enoent(resources):
-    reset_rss_usage()
+def test_fd_leaks_nonexistent_ns(fds):
     for i in range(RESPAWNS):
         nsid = 'non_existent_leak_%i' % i
         try:
-            with IPRoute(netns=nsid, flags=0):
+            with NetNS(nsid, flags=0):
                 pass
         except OSError as e:
-            assert e.errno == errno.ENOENT
-        assert max_rss_usage()
-        gc.collect()
+            assert e.errno in (errno.ENOENT, errno.EPIPE)

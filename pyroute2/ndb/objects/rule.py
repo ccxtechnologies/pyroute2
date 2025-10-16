@@ -3,7 +3,7 @@ from collections import OrderedDict
 from pyroute2.common import get_address_family
 from pyroute2.netlink.rtnl.fibmsg import fibmsg
 
-from ..objects import AsyncObject
+from ..objects import RTNL_Object
 
 schema = fibmsg.sql_schema().unique_index(
     'family',
@@ -40,7 +40,7 @@ init = {
 }
 
 
-class Rule(AsyncObject):
+class Rule(RTNL_Object):
     table = 'rules'
     msg_class = fibmsg
     api = 'rule'
@@ -56,7 +56,7 @@ class Rule(AsyncObject):
                 rules
               '''
         yield ('target', 'tflags', 'family', 'priority', 'action', 'table')
-        for record in view.ndb.schema.fetch(req):
+        for record in view.ndb.task_manager.db_fetch(req):
             yield record
 
     def __init__(self, *argv, **kwarg):

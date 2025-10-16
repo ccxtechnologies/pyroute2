@@ -1,7 +1,6 @@
 '''
 Monitor process exit
 '''
-
 from pyroute2 import TaskStats
 from pyroute2.common import hexdump
 

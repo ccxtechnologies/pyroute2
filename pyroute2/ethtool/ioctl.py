@@ -17,8 +17,6 @@ ETHTOOL_GWOL = 0x00000005
 ETHTOOL_GFLAGS = 0x00000025
 ETHTOOL_GFEATURES = 0x0000003A
 ETHTOOL_SFEATURES = 0x0000003B
-ETHTOOL_GCHANNELS = 0x0000003C
-ETHTOOL_SCHANNELS = 0x0000003D
 ETHTOOL_GLINKSETTINGS = 0x0000004C
 
 ETHTOOL_GSTRINGS = 0x0000001B
@@ -147,7 +145,6 @@ class EthtoolWolInfo(DictStruct):
 
 
 class EthtoolCmd(DictStruct):
-    _layout_ = 'ms'
     _pack_ = 1
     _fields_ = [
         ("cmd", ctypes.c_uint32),
@@ -171,7 +168,6 @@ class EthtoolCmd(DictStruct):
 
 
 class IoctlEthtoolLinkSettings(DictStruct):
-    _layout_ = 'ms'
     _pack_ = 1
     _fields_ = [
         ("cmd", ctypes.c_uint32),
@@ -195,7 +191,6 @@ class IoctlEthtoolLinkSettings(DictStruct):
 
 
 class EthtoolCoalesce(DictStruct):
-    _layout_ = 'ms'
     _pack_ = 1
     _fields_ = [
         # ETHTOOL_{G,S}COALESCE
@@ -275,7 +270,6 @@ class EthtoolValue(ctypes.Structure):
 
 
 class EthtoolSsetInfo(ctypes.Structure):
-    _layout_ = 'ms'
     _pack_ = 1
     _fields_ = [
         ("cmd", ctypes.c_uint32),
@@ -345,28 +339,11 @@ class EthtoolSfeatures(ctypes.Structure):
     ]
 
 
-class EthtoolChannels(DictStruct):
-    _layout_ = 'ms'
-    _pack_ = 1
-    _fields_ = [
-        ("cmd", ctypes.c_uint32),
-        ("max_rx", ctypes.c_uint32),
-        ("max_tx", ctypes.c_uint32),
-        ("max_other", ctypes.c_uint32),
-        ("max_combined", ctypes.c_uint32),
-        ("rx_count", ctypes.c_uint32),
-        ("tx_count", ctypes.c_uint32),
-        ("other_count", ctypes.c_uint32),
-        ("combined_count", ctypes.c_uint32),
-    ]
-
-
 class FeatureState(ctypes.Structure):
     _fields_ = [("off_flags", ctypes.c_uint32), ("features", EthtoolGfeatures)]
 
 
 class EthtoolRingParam(DictStruct):
-    _layout_ = 'ms'
     _pack_ = 1
     _fields_ = [
         ("cmd", ctypes.c_uint32),
@@ -392,7 +369,6 @@ class IfReqData(ctypes.Union):
         ("gstats", ctypes.POINTER(None)),
         ("gfeatures", ctypes.POINTER(EthtoolGfeatures)),
         ("sfeatures", ctypes.POINTER(EthtoolSfeatures)),
-        ("channels", ctypes.POINTER(EthtoolChannels)),
         ("glinksettings", ctypes.POINTER(IoctlEthtoolLinkSettings)),
         ("wolinfo", ctypes.POINTER(EthtoolWolInfo)),
         ("rings", ctypes.POINTER(EthtoolRingParam)),
@@ -400,14 +376,12 @@ class IfReqData(ctypes.Union):
 
 
 class IfReq(ctypes.Structure):
-    _layout_ = 'ms'
     _pack_ = 1
     _anonymous_ = ("u",)
     _fields_ = [("ifr_name", ctypes.c_uint8 * IFNAMSIZ), ("u", IfReqData)]
 
 
 class IfReqSsetInfo(ctypes.Structure):
-    _layout_ = 'ms'
     _pack_ = 1
     _fields_ = [
         ("ifr_name", ctypes.c_uint8 * IFNAMSIZ),
@@ -532,7 +506,7 @@ class IoctlEthtool:
             cmd=ETHTOOL_GSTATS
         )
         self.ifreq.gstats = ctypes.cast(
-            ctypes.byref(gstats), ctypes.POINTER(None)
+            ctypes.pointer(gstats), ctypes.POINTER(None)
         )
         self.ioctl()
         assert len(self.stat_names) == len(gstats.data)
@@ -546,6 +520,7 @@ class IoctlEthtool:
         ifreq_sset.ifr_name = (ctypes.c_uint8 * IFNAMSIZ)(*self.ifname)
         ifreq_sset.info = ctypes.pointer(sset_info)
         fcntl.ioctl(self.sock, SIOCETHTOOL, ifreq_sset)
+        assert sset_info.sset_mask
         return sset_info.data
 
     def get_stringset(
@@ -559,7 +534,7 @@ class IoctlEthtool:
             cmd=ETHTOOL_GSTRINGS, string_set=set_id, len=gstrings_length
         )
         self.ifreq.gstrings = ctypes.cast(
-            ctypes.byref(gstrings), ctypes.POINTER(None)
+            ctypes.pointer(gstrings), ctypes.POINTER(None)
         )
         self.ioctl()
 
@@ -585,17 +560,6 @@ class IoctlEthtool:
 
     def set_features(self, features):
         self.ifreq.sfeatures = ctypes.pointer(features._cmd_set)
-        return self.ioctl()
-
-    def get_channels(self):
-        cmd = EthtoolChannels(cmd=ETHTOOL_GCHANNELS)
-        self.ifreq.channels = ctypes.pointer(cmd)
-        self.ioctl()
-        return cmd
-
-    def set_channels(self, channels):
-        channels.cmd = ETHTOOL_SCHANNELS
-        self.ifreq.channels = ctypes.pointer(channels)
         return self.ioctl()
 
     def get_cmd(self):

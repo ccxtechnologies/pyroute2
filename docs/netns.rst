@@ -4,16 +4,10 @@ NetNS management
 ================
 
 .. automodule:: pyroute2.netns
-    :members: create,
-        remove,
-        attach,
-        setns,
-        pushns,
-        popns,
-        dropns,
-        listnetns,
-        ns_pids,
-        pid_to_ns
+    :members:
 
-.. automodule:: pyroute2.nslink.nspopen
+.. automodule:: pyroute2.nslink
+    :members:
+
+.. automodule:: pyroute2.NSPopen
     :members:

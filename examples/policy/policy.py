@@ -2,7 +2,6 @@
 
 import traceback
 from pprint import pprint
-
 from pyroute2.netlink.generic import GenericNetlinkSocket
 
 if __name__ == '__main__':

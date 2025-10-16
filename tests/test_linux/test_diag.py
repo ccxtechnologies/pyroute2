@@ -1,4 +1,4 @@
-from socket import AF_INET
+from socket import AF_UNIX
 
 from pr2test.marks import require_root
 
@@ -15,17 +15,16 @@ def test_basic():
 
     with DiagSocket() as ds:
         ds.bind()
-        sstats = ds.get_sock_stats(family=AF_INET)
+        sstats = ds.get_sock_stats(family=AF_UNIX)
         for s in sstats:
-            sstats_set.add(s['idiag_inode'])
+            sstats_set.add(s['udiag_ino'])
 
-    with open('/proc/net/tcp') as fd:
+    with open('/proc/net/unix') as fd:
         for line in fd.readlines():
             line = line.split()
             try:
-                pstats_set.add(int(line[9]))
+                pstats_set.add(int(line[6]))
             except ValueError:
                 pass
 
-    assert len(sstats_set - pstats_set) < 10
-    assert len(pstats_set - sstats_set) < 10
+    assert sstats_set == pstats_set

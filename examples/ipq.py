@@ -1,8 +1,7 @@
-from dpkt.ip import IP
-
-from pyroute2 import IPQSocket
 from pyroute2.common import hexdump
+from pyroute2 import IPQSocket
 from pyroute2.netlink.ipq import NF_ACCEPT
+from dpkt.ip import IP
 
 ip = IPQSocket()
 ip.bind()
